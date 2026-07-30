@@ -5,6 +5,458 @@ All notable changes to Hefesto will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [4.13.1] - 2026-05-08
+
+### Fixed
+- **R3 detector false positive on self-managed connections** (PR #35).
+  R3 (`RELIABILITY_SESSION_LIFECYCLE`) now correctly handles `ast.Attribute`
+  assign targets such as `self._conn = sqlite3.connect(...)` and recognizes
+  the lazy-getter cache pattern: when a class assigns a connection to
+  `self.<attr>` and a sibling method invokes `self.<attr>.close()` (or
+  `disconnect`/`shutdown`/`dispose`), R3 no longer emits a finding.
+  - Eliminates messages containing the literal `'None'` literal that
+    previously surfaced when targets were not `ast.Name`.
+  - Negative-control unchanged: local-variable connections without cleanup
+    still emit R3 correctly.
+  - Added `tests/fixtures/reliability_drift/r3_self_attr_managed.py` mirroring
+    the SwarmStore lazy-getter pattern that surfaced FP-1 during EPIC 4
+    Phase D warn soak (2026-05-08).
+  - Added `test_r3_self_attribute_with_close_method_no_finding` and
+    `test_r3_message_never_contains_assigned_to_none` (regression guard).
+
+## [4.13.0] - 2026-05-06
+
+### Added
+- **Parser-failure visibility**: When tree-sitter-dependent languages
+  (TypeScript, JavaScript, Java, Go, Rust, C#) silently skipped due to a
+  missing `[multilang]` extra or other parser errors, Hefesto now emits a
+  categorized warning to stderr at the end of analysis and exposes the
+  structured data via `report.meta.parser_failures` in JSON output.
+  - Categorization distinguishes `parser_unavailable` (suggests
+    `pip install hefesto-ai[multilang]`) from `parse_error` (encoding,
+    syntax, runtime mismatch — no install hint).
+  - Strong-signal categorization: when language requires tree-sitter
+    (in `ParserFactory.GRAMMAR_NAMES`) and `USE_PREBUILT=False`,
+    classify as `parser_unavailable` regardless of exception type or
+    message. Catches API drift in `tree-sitter` core (e.g.,
+    `TypeError` from the deprecated manual `Language(path, name)`
+    fallback that no longer matches current `tree-sitter` signatures).
+    Falls back to the exception-type heuristic only when language
+    context is unavailable (unit-test callers).
+  - Conservative: ambiguous failures default to `parse_error` to avoid
+    false positives on the install hint.
+  - `--quiet` suppresses the stderr warning while preserving the
+    structured `meta.parser_failures` field for programmatic consumers.
+  - JSON shape: `report.meta.parser_failures = [{"path", "language",
+    "category", "exception"}, ...]` (top-level under `meta`, alongside
+    `multilang`, `scope`, `reliability_pack_summary`).
+- `AnalyzerEngine.__init__` accepts a new `quiet: bool = False` keyword
+  argument, propagated by the CLI from `--quiet`.
+- **CI smoke for `[multilang]` extra**: new workflow
+  `.github/workflows/multilang-smoke.yml` validates that
+  `pip install -e ".[multilang]"` resolves cleanly and that
+  `tree_sitter_language_pack.get_parser(<lang>)` returns a working
+  parser for each of the 6 supported languages
+  (`javascript`, `typescript`, `java`, `go`, `rust`, `csharp`) under
+  Python 3.10–3.13. Asserts that each parsed AST has at least one
+  top-level node. Scope is intentionally narrow: this job does NOT
+  validate Hefesto's `meta.parser_failures` surfacing, the PRO bridge,
+  or graceful degradation without the extra — those properties are
+  defended by their own tests. Workflow header documents the
+  three-name mapping (`Language.CSHARP.value` / `GRAMMAR_NAMES` /
+  `LANG_MAP` / language-pack manifest) so future readers don't
+  "correct" the intentional naming layers.
+
+### Changed
+- **Defense against `tree-sitter-language-pack` 1.6.3 broken cp312 wheel**:
+  upstream's 1.6.3 release shipped only a `cp312-cp312` wheel whose top-level
+  directory was renamed to `_native/`, breaking
+  `import tree_sitter_language_pack` on Python 3.12. The new
+  `multilang-smoke` workflow (added in this same PR) caught this on its
+  first run. Pin extended to `>=1.0.0,!=1.6.3,<2.0` to skip the broken
+  release; `1.7.0+` is unaffected and resolves automatically. Tracked
+  upstream as `kreuzberg-dev/tree-sitter-language-pack#108` (closed;
+  malformed publish, superseded by 1.7.0) and `#116` (open).
+- **Tightened `[multilang]` extra pin**: `tree-sitter-language-pack>=1.0.0,<2.0`
+  (was `>=0.7.0`, no upper bound).
+  - Documents the actual compat range of the API surface used by Hefesto today
+    (PyPI latest 1.6.2 satisfies the new range).
+  - Rules out 0.x lines that no longer track `tree-sitter` core's current
+    `Language` signature — the same drift surfaced as `TypeError` in Item 1's
+    integration test of the deprecated manual fallback path.
+  - Prevents accidental future drift to a 2.x major before the API surface is
+    re-verified.
+  - No change for users who installed `[multilang]` after early-2025 (pip was
+    already resolving to 1.x).
+
+### Documentation
+- Aligned `README.md`, `.github/copilot-instructions.md`,
+  `docs/INSTALLATION.md`, `docs/QUICK_START.md`, and
+  `docs/GETTING_STARTED.md` with the new `[multilang]` extra surfacing
+  introduced in this release. The 6 tree-sitter languages (TypeScript,
+  JavaScript, Java, Go, Rust, C#) now have explicit install instructions
+  across all install-related surfaces. Framing chosen: `[multilang]` is
+  **required** for those languages (matches the runtime stderr warning
+  users see if they skip the extra), not "optional but recommended".
+- Fixed pre-existing typo `pip install hefesto` → `pip install hefesto-ai`
+  in `docs/QUICK_START.md` (2 occurrences) and `docs/INSTALLATION.md`
+  (3 occurrences, including the uninstall command).
+
+### Fixed
+- **C# parsing under `[multilang]` extra**: `tree-sitter-language-pack`'s
+  manifest registers C# under the canonical name `csharp`; Hefesto's
+  `LANG_MAP` passed through the legacy alias `c_sharp`, which is NOT in
+  the pack's manifest. With an empty download cache (every CI run, every
+  fresh user install), `get_parser("c_sharp")` failed with
+  `LanguageNotFoundError` and the parsers tarball was never downloaded —
+  every `.cs` file silent-skipped persistently. The bug was masked on
+  warm caches because `libtree_sitter_c_sharp.dylib` becomes
+  filesystem-resolvable once any other call (e.g. `get_parser("csharp")`)
+  has populated the cache, even though manifest lookup still fails.
+  Fixed by mapping `c_sharp` → `csharp` in `LANG_MAP`. Audited the full
+  `LANG_MAP` against the manifest; this is the only mismatch (the other
+  5 entries — `typescript`, `javascript`, `java`, `go`, `rust` — are
+  correct).
+
+## [4.12.1] - 2026-04-27
+
+### Fixed
+- **Documentation drift after v4.12.0 COBOL release**: 4 surfaces still
+  said "21 formats" after the v4.12.0 docs sweep updated the others.
+  - `README.md` header and footer taglines (lines 7, 680)
+  - `.github/copilot-instructions.md` overview and FREE tier row (lines 5, 55)
+- **Stale "Current Status" version blocks**: `CLAUDE.md:115` and
+  `docs/CLAUDE_HEFESTO.md:44` were stuck at `v4.11.4` despite v4.12.0
+  being the latest release — bumped both to `v4.12.0`.
+- **GitHub Marketplace tagline lag**: the Marketplace listing page
+  cached the pre-COBOL "21 formats" string from before the v4.12.0
+  publish. This metadata-only patch release forces the Marketplace to
+  re-pull `action.yml` (which has been correct since v4.12.0) so the
+  public-facing tagline reflects the actual format count.
+
+Metadata-only release. No code, test, or behavior changes.
+
+## [4.12.0] - 2026-04-25
+
+### Added
+- **COBOL Governance Analysis (Phase 1-Lite)**: 7 mainframe governance rules for COBOL-85 and IBM Enterprise COBOL
+  - FREE tier (3 rules): GOTO_EXCESSIVE (>10 threshold), HARDCODED_CREDENTIALS, ACCEPT_UNVALIDATED
+  - PRO tier (4 rules): REDEFINES_SENSITIVE, OCCURS_DEPENDING_ON, PERFORM_THRU_CHAIN (>5 paragraphs), COPYBOOK_BLAST_RADIUS
+  - 30 COBOL tests (10 detection + 20 governance) - all passing
+  - Internal structural extractor (regex-based, COBOL-85 fixed-format columns 7-72)
+  - Multi-line pattern detection for complex COBOL constructs (OCCURS DEPENDING ON, PERFORM THRU, REDEFINES)
+  - Copybook (.cpy) exclusion from procedural rules
+  - 11 synthetic COBOL test fixtures (positive/negative/edge cases)
+  - Performance: 0.74s for 11 files (6.7x faster than <5s target)
+  - Investor demo script: `docs/demo/cobol_investor_demo.sh`
+  - CLI integration verified: single file, directory, severity filtering
+  - **22 supported formats** (7 code + 11 DevOps + 4 Cloud IaC)
+  - 531 tests passing (zero regression)
+
+### Fixed
+- **COBOL OCCURS DEPENDING ON line number reporting**: Now reports correct source line instead of placeholder line 1
+- **CI discovery for COBOL analyzer**: Moved from `hefesto/analyzers/cobol_governance.py` to `hefesto/analyzers/devops/cobol_governance_analyzer.py` to match CI discovery pattern
+- **Documentation sweep**: Updated all docs from 21→22 formats across 10 files (6 OSS + 4 PRO-PRIVATE)
+- **Sync version references to v4.11.4** across `llms.txt`, `server.json`,
+  `.well-known/agent-card.json`, `skill/SKILL.md`, and
+  `.github/copilot-instructions.md` (3 occurrences). These files were stuck
+  at v4.11.1 because prior version-parity checks only covered README.md.
+- Extend `scripts/verify_readme.py` to cover those 5 additional files
+  (closes #7). 10 version references validated across 6 files.
+- Use `re.finditer` instead of `re.search` so every version reference in a
+  file is validated (README has 3 active refs that previously went unchecked
+  after the first match).
+- Enforce strict SemVer pattern `\d+\.\d+\.\d+` in all version regexes to
+  reject malformed strings like `v4.11` or `v4.11.4.dev0`.
+- Read source version directly from `pyproject.toml` via `tomllib` instead
+  of `importlib.metadata`, so stale editable installs cannot mask drift.
+
+## [4.11.4] - 2026-04-17
+
+### Added
+- **Environment classification in telemetry**: pings now include `env`
+  (Postgres TEXT[] array) detecting CI, Docker, Kubernetes environments.
+  All matching flags appended — e.g. GitHub Actions produces `{ci,github_actions}`.
+  Default: `{user}`. Enables `'ci' = ANY(env)` queries for filtering.
+- **Install source detection**: `src` field reports `pypi`, `editable`, or
+  `unknown` — distinguishes production installs from development installs.
+
+## [4.11.3] - 2026-04-14
+
+### Added
+- **Anonymous session_id**: telemetry pings now include a stable random
+  identifier (12-hex UUID4 prefix) stored in `~/.hefesto/.session_id`.
+  No IP, no PII — enables unique user counting without tracking.
+  Delete the file to reset. Disable all telemetry: `HEFESTO_TELEMETRY=0`.
+
+## [4.11.2] - 2026-04-13
+
+### Fixed
+- **BARE_EXCEPT reraise exclusion**: `except: raise` (bare reraise without
+  arguments) is now excluded from BARE_EXCEPT findings. This is an
+  intentional pattern used in greenlet/generator boundaries (e.g.
+  SQLAlchemy). `except: pass` and multi-statement bodies with raise
+  are still flagged. SQLAlchemy: 49→44 findings.
+- **HARDCODED_SECRET AWS class name FP**: The `AWS[A-Z0-9]{16,}` pattern
+  now uses case-sensitive matching via `(?-i:...)` inline flag so
+  mixed-case identifiers like `AWSEventStreamDecoder` no longer trigger.
+  Anthropic SDK: 9→0 false positives. Real AWS keys (all-uppercase)
+  remain detected.
+- **ATTRIBUTE_NAME_MISMATCH descriptor FP**: Class-level assignments
+  (descriptors like `padding = PaddingProperty()`, class variables,
+  annotated class attributes) are now collected as valid attribute names.
+  Rich: 8→0 false positives.
+- **ATTRIBUTE_NAME_MISMATCH method reference FP**: All method names
+  defined in a class are treated as valid `self.<name>` references,
+  covering `@reify`, `@cached_property`, custom decorators, and method
+  references passed as callbacks (e.g. `loop.call_at(when,
+  self._send_heartbeat)`). aiohttp: 15→0 false positives.
+- **Telemetry exit_code**: `_ping_remote()` now includes `exit_code` in
+  the payload. Previously all 1016 rows had NULL.
+- Total suite: 485 passed (was 476), 0 regressions.
+
+## [4.11.1] - 2026-04-13
+
+### Fixed
+- **ATTRIBUTE_NAME_MISMATCH property FP**: `@property`, `@x.setter`,
+  and `@x.deleter` methods are now recognized as valid attributes.
+  Eliminates 55 false positives across httpx (27→0) and Rich (28→8,
+  residual 8 are exotic descriptors/bitfields within BP-7 target).
+  2 new precision tests.
+
+### Added
+- **pre-commit hook**: `.pre-commit-hooks.yaml` with `hefesto-analyze`
+  hook for the [pre-commit](https://pre-commit.com) framework.
+- Total suite: 476 passed (was 474), 0 regressions.
+
+## [4.11.0] - 2026-04-12
+
+### Added
+- **Phase 4 — Narrow Semantic Analyzer**: two narrow, computable,
+  auditable checks for Python files via `NarrowSemanticAnalyzer`,
+  registered as a file-level analyzer in `hefesto analyze`.
+  - **ATTRIBUTE_NAME_MISMATCH** (`NS-ATTR-001`): detects `self.x`
+    assigned in `__init__` but `self.y` read elsewhere where `y` is
+    a close match to `x` (probable typo / rename miss). Uses
+    `difflib.get_close_matches` with cutoff 0.8. Excludes classes
+    with `__getattr__`, `setattr()`, or `__dict__` access to avoid
+    false positives on dynamic attribute patterns. Severity: MEDIUM.
+  - **SILENT_EXCEPTION_SWALLOW** (`NS-SWALLOW-001`): detects
+    `except Exception` or `except BaseException` handlers whose body
+    is trivially silent (`pass`, `return None`, `return ""`,
+    `return []`, `return {}`, `return 0`, `return False`, `...`).
+    Bare `except:` is excluded — already covered by `BARE_EXCEPT` in
+    SecurityAnalyzer. Severity: MEDIUM.
+  - Check 3 (DERIVED_VALUE_IN_LOGIC) deferred per Socratic audit —
+    no empirical evidence to validate it yet.
+- **Cross-repo schema contract test**: `PR_REVIEW_FINDING_KEYS` frozenset
+  in `tests/test_pr_review_schema_contract.py` pins the 12-key finding
+  dict produced by `_filter_and_serialize()`. Drift in either OSS or Pro
+  breaks the respective test before reaching production.
+- **`code_snippet` in PR review JSON**: `_filter_and_serialize()` now
+  includes `issue.code_snippet` (was silently dropped). Additive field,
+  `null` by default.
+- **Phase 3.1 — Enrichment rendering in PR comments**:
+  `_format_comment_body()` renders `finding["enrichment"]["summary"]`
+  as `**AI insight:** ...` when enrichment status is `"ok"` and summary
+  is non-empty. Deterministic-only output unchanged. Error/skipped
+  enrichment degrades silently.
+- **Upgrade notice**: `hefesto analyze` now shows a one-line notice when
+  a newer version is available on PyPI (via telemetry ping response).
+
+### Fixed
+- **`contextlib.suppress(ImportError)` guard recognition**:
+  `ImportsVsDepsAnalyzer._dispatch_node()` now recognizes
+  `with suppress(ImportError):` and `with contextlib.suppress(...)` as
+  optional-import guards, preventing false `UNDECLARED_DEPENDENCY`
+  findings on guarded imports. Also handles `ModuleNotFoundError`.
+- **SQL injection single-char format-spec FN resolved**:
+  `SecurityAnalyzer._check_sql_percent_binop()` uses AST `BinOp(Mod)`
+  to catch `"SQL..." % i` where `i` is a single-char variable that the
+  regex misclassified as a DB-API placeholder. DB-API parameterized
+  queries (`cur.execute("...%s", (i,))`) remain unaffected — they are
+  `Call` nodes, not `BinOp`. Closes the documented Phase 1c debt.
+- Total suite: 474 passed (was 430), 0 regressions.
+
+## [4.10.0] - 2026-04-12
+
+### Added
+- **Phase 2 — OSS PR review**: new `hefesto pr-review` command plus a
+  `hefesto/pr_review/` package providing diff-scoped analysis with
+  deterministic dedup keys.
+  - `AnalyzerEngine.analyze_files(paths, project_root=None)`: new entry
+    point that runs file analyzers on an explicit path list (no glob
+    discovery) and still runs project analyzers once against the
+    project root so cross-file findings remain available for filtering.
+  - `hefesto/pr_review/diff.py`: stdlib-only unified-diff parser with
+    `FileDiff` / `Hunk` dataclasses. Handles adds, deletes, renames,
+    binary markers, no-newline markers, and hunks with implicit counts.
+  - `hefesto/pr_review/dedup.py`: `compute_dedup_key(finding, *,
+    relative_path)` returning `sha256:<hex>` over
+    `relative_path|line|type|normalized_message`. Normalisation strips
+    absolute paths, numeric drift, and whitespace so reruns across
+    checkout directories or minor metric shifts produce the same key.
+  - `hefesto/pr_review/orchestrator.py`: `run_pr_review(root, base,
+    head, strict)` wires `git diff` → diff parser → `analyze_files` →
+    hunk filter → JSON. Default surfaces only findings whose line
+    falls inside a changed hunk; `--strict` additionally surfaces
+    file-level context findings. Project analyzer findings are kept
+    only when anchored to a file in the diff.
+  - `hefesto/pr_review/post.py`: `--post` convenience mode that shells
+    out to `gh api` once per in-hunk finding. Intentionally
+    non-idempotent — reruns create duplicate comments. Each comment
+    body embeds a
+    `<!-- hefesto-pr-review: dedup_key=sha256:<hex> -->` marker so
+    downstream pipelines can deduplicate.
+  - `hefesto pr-review` CLI with `--base`, `--head`, `--strict`,
+    `--post`, `--repo`, `--pr`, `--project-root`. Default emits JSON
+    to stdout; `--post` delegates posting to `gh`. No network code
+    in the Python core.
+  - Two GitHub Actions workflow templates under
+    `examples/github-actions/`:
+    `hefesto-pr-review-simple.yml` (convenience mode, not idempotent)
+    and `hefesto-pr-review-deduped.yml` (production mode that
+    extracts dedup markers from existing comments via `gh api`+`jq`
+    and filters new findings before posting). `examples/github-actions/README.md`
+    documents which template to pick and how dedup works.
+  - 33 new tests: engine scoped analysis (6), diff parser (10),
+    dedup keys (8), orchestrator canary (5), CLI smoke (4). Total
+    suite 423 passed, 0 regressions from STEP 3 (390 → 423, +33).
+
+### Fixed
+- **Phase 1c — SecurityAnalyzer precision cleanup**: three false-positive
+  classes eliminated with before/after fixture evidence.
+  - **SQL_INJECTION_RISK** (`hefesto/analyzers/security.py`): the
+    `_has_dynamic_concatenation` heuristic treated DB-API placeholders
+    (`%s`, `%d`, `%(name)s`) as Python `%` interpolation, flagging every
+    parameterized psycopg2 / Django `.raw()` / cursor call as potential
+    injection. Replaced with a regex that distinguishes a real Python
+    `%` operator (`"..." % expr`) from an in-string placeholder by
+    requiring a closing quote followed by `%` followed by an
+    expression, with a negative lookahead for printf format-spec
+    characters that are followed by end-of-spec (non-word / EOL).
+    Fixture corpus: `tests/fixtures/sqli_safe_patterns/` — 4 safe
+    fixtures (psycopg2, sqlite3, SQLAlchemy `text()`, Django raw) + 1
+    true-positive fixture with 3 real injection patterns. BEFORE:
+    4 FPs / 3 TPs (43% FP rate). AFTER: 0 FPs / 3 TPs (100%
+    precision). 11 legacy SQLi tests plus 6 new precision tests all
+    pass.
+  - **ASSERT_IN_PRODUCTION**: the legacy detector walked the
+    GenericAST and did a substring search for `"assert "` on every
+    node, which matched module-root / class / function containers
+    whose descendant text happened to include that substring — 31 FPs
+    on the Hefesto repo itself (where `ast.parse` reports 0 real
+    `ast.Assert` statements in non-test files). Rewritten to use
+    Python's `ast.walk` + `isinstance(node, ast.Assert)`, matching the
+    pattern already used for `eval`/`exec`. 7 new precision tests.
+  - **BARE_EXCEPT**: the legacy detector used ``NodeType.CATCH`` +
+    regex on ``node.text`` and empirically emitted zero findings on
+    real bare-except Python code — dead code in the pipeline.
+    Rewritten to walk ``ast.ExceptHandler`` nodes with
+    ``node.type is None``. 6 new tests covering bare, typed, tuple,
+    ``Exception``-typed, multi-handler, and docstring-mention cases.
+  - **PICKLE_USAGE**: the legacy detector matched any import whose
+    text contained the substring `"pickle"`, flagging
+    `from unpickler_utils import safe_load`, `from hefesto_pro import
+    PickleHandler`, and `import pickling_config` as unsafe pickle
+    imports. Rewritten to use `ast.Import` / `ast.ImportFrom` with
+    exact module-name comparison against `{pickle, cPickle}`. 7 new
+    precision tests covering substring imports, docstring mentions,
+    and real `import pickle` recall preservation.
+
+### Changed
+- **Phase 1b — ci_parity unification**: findings from
+  `hefesto/validators/ci_parity.py` now surface in `hefesto analyze` via
+  the new `CiParityAnalyzer` adapter under
+  `hefesto/analyzers/operational_truth/`. The legacy `check-ci-parity`
+  CLI command and `CIParityChecker` class remain unchanged (single
+  source of truth for detection); the analyzer maps `ParityIssue`
+  categories to the unified `AnalysisIssue` model:
+  - Python Version → `CI_CONFIG_DRIFT` / `OT-CI-001` / MEDIUM →
+    targets `.github/workflows/*.yml`
+  - Tool Installation → `CI_CONFIG_DRIFT` / `OT-CI-002` / LOW (demoted
+    from legacy HIGH — it describes the developer's machine, not the
+    repo, so inflating the severity would breach BP-7 for users who
+    legitimately run Hefesto without every CI tool installed locally)
+  - Flake8 Config → `CI_CONFIG_DRIFT` / `OT-CI-003` / HIGH → targets
+    `.flake8` / `setup.cfg` / `pyproject.toml` in that priority order
+  - New `AnalysisIssueType.CI_CONFIG_DRIFT` value.
+  - 5 new tests in `tests/test_ci_parity_analyzer.py` pin the adapter
+    mapping; the 20 legacy tests in `tests/validators/test_ci_parity.py`
+    continue to pin detection semantics unchanged.
+  - `hefesto.validators.test_contradictions` is out of scope for Phase
+    1b — it is a test-AST analyzer, a different semantic domain than CI
+    config drift, and is tracked as separate future work.
+
+### Added
+- **Phase 1a — Operational Truth Analyzers**: four project-level analyzers
+  integrated into `hefesto analyze` via the new `register_project_analyzer`
+  hook on `AnalyzerEngine`.
+  - `ImportsVsDepsAnalyzer` (`OT-IMPORTS-001`): detects Python imports not
+    declared in `pyproject.toml` / `requirements*.txt`. Skips imports under
+    `try/except ImportError`, bare `except`, structurally-pure try bodies,
+    and `if TYPE_CHECKING:` guards. Accepts `google-*` namespaces without
+    hard-coded mappings.
+  - `DocsVsEntrypointsAnalyzer` (`OT-DOCS-001`): detects `[project.scripts]`
+    entries missing from README.
+  - `PackagingParityAnalyzer` (`OT-PKG-001/002`): detects version drift
+    between `pyproject.toml`, `CHANGELOG.md`, and README. Patterns are
+    derived from `[project].name` and `[project.urls]` so the analyzer is
+    repo-agnostic.
+  - `InstallArtifactParityAnalyzer` (`OT-INSTALL-001/002`): detects
+    `action.yml` inputs never consumed in `scripts/action_entrypoint.sh`
+    and `Dockerfile.action` `COPY` sources that do not exist in the repo.
+  - New `AnalysisIssueType` values: `UNDECLARED_DEPENDENCY`,
+    `DOCS_ENTRYPOINT_DRIFT`, `PACKAGING_VERSION_DRIFT`, `INSTALL_ARTIFACT_DRIFT`.
+  - Synthetic `FileAnalysisResult` entries created for project-level
+    findings are excluded from the `files_analyzed` summary count.
+  - 18 new tests in `tests/test_operational_truth.py` (unit + canary +
+    reporter smoke + optional-import guard regressions).
+
+## [4.9.6] - 2026-03-10 — COMMAND_INJECTION Detection
+
+### Added
+- **COMMAND_INJECTION detection**: Flags `os.system()`, `os.popen()`, and `subprocess.call/Popen/run(shell=True)` with dynamic string concatenation (f-strings, %, +, .format). Same 3-condition pattern as SQL_INJECTION_RISK. Severity: HIGH.
+
+## [4.9.5] - 2026-03-09 — Security Fixes + Dependency Cleanup
+
+### Fixed
+- **CodeQL path traversal (10 alerts)**: Added `resolve_under_root` + `Path.resolve()` for CodeQL-recognized sanitization across all file-handling code paths.
+- **GitHub Actions workflow permissions**: Hardened workflow permissions to resolve CodeQL security alerts.
+
+### Changed
+- **Dependency cleanup**: Core `pip install hefesto-ai` now installs only 7 packages (click, pydantic, tree-sitter, radon, mccabe, colorama, jinja2). Moved linters, server, cloud, ML, and dev tools to optional extras: `[server]`, `[cloud]`, `[lint]`, `[dev]`, `[ml]`, `[all]`.
+- **Package description**: Updated to "Pre-commit security & complexity analysis in 0.01s".
+
+## [4.9.4] - 2026-03-03 — Context-Aware SQLi Detection + README Overhaul
+
+### Fixed
+- **SQL injection false positives**: Rewrote `SQL_INJECTION_RISK` detector to require 3 conditions — SQL keyword in string literal + dynamic concatenation + DB execute sink in enclosing scope. Flask false positives: 43 → 0.
+- **mypy --strict compliance**: Added type annotation for empty `issues` list in `_check_sql_injection`.
+
+### Added
+- **IRIS Telemetry Aggregates Contract v1**: Public spec, JSONL validator, architecture docs.
+- **Reliability Drift Gates (EPIC 4)**: Resource Safety Pack v1 (5 rules), Memory Budget Gate, IRIS ingest mount, 14 new tests.
+- **Demo GIF**: 3-frame animated demo showing HARDCODED_SECRET, EVAL_USAGE, HIGH_COMPLEXITY, SQL_INJECTION_RISK findings.
+
+### Changed
+- **README**: Restructured for cold traffic conversion — GIF hero, 30-second Quick Start, merged "What Hefesto Catches" table, compact GitHub Action example.
+
+## [4.9.3] - 2026-02-23 — OSS pro_optional Wiring + Dev Tooling
+### Changed
+- **Dev tooling**: Pinned `black==26.1.0` and `isort==6.1.0` in `requirements-dev.txt` to match CI.
+- **pro_optional**: Wired optional `hefesto_pro` epics (scope gating, enrichment, API hardening) via `pro_optional.py`.
+
+## [4.9.2] - 2026-02-19 — Exit Code Semantics + CLI Hardening
+### Changed
+- **Exit codes**: `--fail-on` gate failure now exits 1 (was 2). Without `--fail-on`, always exits 0.
+- **JSON output**: `--output json` sends all banners/diagnostics to stderr, stdout is pure JSON.
+- **Default excludes**: `.venv/`, `node_modules/`, `__pycache__/`, `.git/`, etc. excluded by default.
+- **SQLi sink detection**: SQL injection findings downgraded to MEDIUM when no `.execute()` sink in scope.
+- **CI**: Smoke test aligned to exit code 1; black/mypy/flake8 clean.
+
 ## [4.9.0] - 2026-02-14 — Public/Private Boundary Enforcement
 ### Changed
 - **Boundary**: Public repo now ships Community Edition only (FREE tier).

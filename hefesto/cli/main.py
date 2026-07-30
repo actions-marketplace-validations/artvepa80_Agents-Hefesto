@@ -106,11 +106,47 @@ def serve(host: Optional[str], port: Optional[int], reload: bool):
         hefesto serve --port 9000
         hefesto serve --reload  # Development mode
     """
-    click.echo(
-        "This feature requires Hefesto PRO/OMEGA. " "Install from the private distribution.",
-        err=True,
+    from hefesto.pro_optional import HAS_API_HARDENING
+
+    if not HAS_API_HARDENING:
+        click.echo(
+            "This feature requires Hefesto PRO/OMEGA. " "Install from the private distribution.",
+            err=True,
+        )
+        _exit(1)
+
+    try:
+        from hefesto.server import create_app
+    except ImportError as e:
+        click.echo(f"Server dependencies missing: {e}", err=True)
+        click.echo("Install with: pip install hefesto-ai[server]", err=True)
+        _exit(1)
+
+    from hefesto.pro_optional import HardeningSettings, apply_hardening
+
+    settings = HardeningSettings()
+    resolved_host = host or settings.bind_host
+    resolved_port = port or 8080
+
+    app = create_app()
+    apply_hardening(app, settings=settings)
+
+    # Mount IRIS ingest endpoints if available (PRO + IRIS installed)
+    _mount_iris_ingest(app)
+
+    click.echo(f"Starting Hefesto API server on {resolved_host}:{resolved_port}")
+    if HAS_API_HARDENING:
+        click.echo("  Hardening: ACTIVE (CORS, auth, rate-limit, request-id)")
+
+    import uvicorn
+
+    uvicorn.run(
+        app,
+        host=resolved_host,
+        port=resolved_port,
+        reload=reload,
+        log_level="info",
     )
-    _exit(1)
 
 
 @cli.command()
@@ -158,6 +194,31 @@ def serve(host: Optional[str], port: Optional[int], reload: bool):
         " (e.g., VERY_HIGH_COMPLEXITY,LONG_FUNCTION)"
     ),
 )
+# -- Scope gating flags (PRO EPIC 1) --
+@click.option("--include-third-party", is_flag=True, help="Include third-party files in analysis")
+@click.option("--include-generated", is_flag=True, help="Include generated files in analysis")
+@click.option("--include-fixtures", is_flag=True, help="Include test fixture files in analysis")
+@click.option("--scope-allow", multiple=True, help="Extra path patterns to include (repeatable)")
+@click.option("--scope-deny", multiple=True, help="Extra path patterns to exclude (repeatable)")
+# -- Reliability drift flags (EPIC 4) --
+@click.option(
+    "--enable-memory-budget-gate",
+    is_flag=True,
+    help="Enable opt-in memory budget gate (EPIC 4). Threshold via env var.",
+)
+# -- Enrichment flags (PRO EPIC 3) --
+@click.option(
+    "--enrich",
+    type=click.Choice(["off", "local", "remote"], case_sensitive=False),
+    default="off",
+    help="Enrichment mode: off (default), local, or remote (requires PRO)",
+)
+@click.option("--enrich-provider", multiple=True, help="Enrichment provider allowlist (repeatable)")
+@click.option(
+    "--enrich-timeout", type=int, default=30, help="Enrichment timeout in seconds (default: 30)"
+)
+@click.option("--enrich-cache-ttl", type=int, default=300, help="Enrichment cache TTL in seconds")
+@click.option("--enrich-cache-max", type=int, default=500, help="Enrichment cache max entries")
 def analyze(
     paths: Tuple[str, ...],
     severity: str,
@@ -168,6 +229,17 @@ def analyze(
     quiet: bool,
     max_issues: Optional[int],
     exclude_types: str,
+    enable_memory_budget_gate: bool,
+    include_third_party: bool,
+    include_generated: bool,
+    include_fixtures: bool,
+    scope_allow: Tuple[str, ...],
+    scope_deny: Tuple[str, ...],
+    enrich: str,
+    enrich_provider: Tuple[str, ...],
+    enrich_timeout: int,
+    enrich_cache_ttl: int,
+    enrich_cache_max: int,
 ):
     """
     Analyze code files or directories.
@@ -182,28 +254,94 @@ def analyze(
         hefesto analyze . --fail-on HIGH  # CI gate
         hefesto analyze . --quiet  # Summary only
     """
+    # When --output json, all non-JSON text goes to stderr so stdout is pure JSON.
+    json_mode = output == "json"
+
     paths_list = list(paths)
-    _echo_analysis_config(paths_list, severity, exclude, quiet)
+    _echo_analysis_config(paths_list, severity, exclude, quiet, json_mode)
 
     # Parse exclude patterns
     exclude_patterns = [p.strip() for p in exclude.split(",") if p.strip()]
 
+    # Build scope gating config (PRO EPIC 1)
+    scope_config = _build_scope_config(
+        include_third_party,
+        include_generated,
+        include_fixtures,
+        scope_allow,
+        scope_deny,
+    )
+
+    # Build enrichment config (PRO EPIC 3)
+    enrich_config = _build_enrich_config(
+        enrich,
+        enrich_provider,
+        enrich_timeout,
+        enrich_cache_ttl,
+        enrich_cache_max,
+    )
+
     try:
-        engine = _setup_analyzer_engine(severity, quiet)
+        engine = _setup_analyzer_engine(severity, quiet, json_mode, scope_config, enrich_config)
         if not engine:
             _exit(1)
 
-        all_file_results, total_loc, total_duration = _run_analysis_loop(
-            engine, paths_list, exclude_patterns
-        )
+        # Memory budget gate (EPIC 4, opt-in)
+        budget_result = None
+        if enable_memory_budget_gate:
+            from hefesto.core.memory_budget_gate import MemoryBudgetGate
+
+            gate = MemoryBudgetGate()
+            (all_file_results, total_loc, total_duration, source_cache), budget_result = (
+                gate.measure(lambda: _run_analysis_loop(engine, paths_list, exclude_patterns))
+            )
+            if not quiet and not json_mode:
+                click.echo(f"  Memory gate: {budget_result.message}", err=json_mode)
+        else:
+            all_file_results, total_loc, total_duration, source_cache = _run_analysis_loop(
+                engine, paths_list, exclude_patterns
+            )
+
+        _run_ml_analysis(all_file_results, source_cache, quiet, json_mode)
+
+        meta = engine._build_meta() if hasattr(engine, "_build_meta") else {}
+        if budget_result is not None:
+            meta["dynamic_budget_results"] = budget_result.to_dict()
 
         combined_report = _generate_report(
-            all_file_results, total_loc, total_duration, output, save_html
+            all_file_results,
+            total_loc,
+            total_duration,
+            output,
+            save_html,
+            meta=meta,
         )
 
         _print_report(combined_report, output, save_html, quiet, max_issues)
 
-        exit_code = _determine_exit_code(combined_report, fail_on, exclude_types, quiet)
+        exit_code = _determine_exit_code(combined_report, fail_on, exclude_types, quiet, json_mode)
+
+        # Anonymous usage ping — also caches latest_version for upgrade notice
+        from hefesto.telemetry.client import _ping_remote, get_upgrade_notice
+
+        _ping_remote(
+            {
+                "event": "analyze",
+                "v": __version__,
+                "os": sys.platform,
+                "py": f"{sys.version_info.major}.{sys.version_info.minor}",
+                "files": combined_report.summary.files_analyzed,
+                "duration_ms": int(combined_report.summary.duration_seconds * 1000),
+                "issues": combined_report.summary.total_issues,
+                "exit_code": exit_code,
+            }
+        )
+
+        # Upgrade notice (after report, before exit)
+        upgrade_msg = get_upgrade_notice(__version__)
+        if upgrade_msg and not quiet:
+            click.echo(upgrade_msg, err=json_mode)
+
         _exit(exit_code)
 
     except Exception as e:
@@ -211,14 +349,15 @@ def analyze(
         _exit(1)
 
 
-def _echo_analysis_config(paths_list, severity, exclude, quiet):
+def _echo_analysis_config(paths_list, severity, exclude, quiet, json_mode=False):
+    use_stderr = json_mode
     if not quiet:
-        click.echo(f"Analyzing: {', '.join(paths_list)}")
-        click.echo(f"Minimum severity: {severity.upper()}")
+        click.echo(f"Analyzing: {', '.join(paths_list)}", err=use_stderr)
+        click.echo(f"Minimum severity: {severity.upper()}", err=use_stderr)
 
     exclude_patterns = [p.strip() for p in exclude.split(",") if p.strip()]
     if exclude_patterns and not quiet:
-        click.echo(f"Excluding: {', '.join(exclude_patterns)}")
+        click.echo(f"Excluding: {', '.join(exclude_patterns)}", err=use_stderr)
 
 
 @cli.command()
@@ -374,6 +513,118 @@ def check_test_contradictions(test_directory: str):
         _exit(1)
 
 
+@cli.command(name="pr-review")
+@click.option(
+    "--project-root",
+    type=click.Path(exists=True, file_okay=False),
+    default=".",
+    help="Project root containing the git repo (default: .)",
+)
+@click.option(
+    "--base",
+    default=None,
+    help="Base ref/SHA for the diff (default: auto-detect via merge-base or GITHUB_BASE_REF)",
+)
+@click.option(
+    "--head",
+    default=None,
+    help="Head ref/SHA for the diff (default: auto-detect via HEAD or GITHUB_SHA)",
+)
+@click.option(
+    "--strict",
+    is_flag=True,
+    help="Include findings anywhere in touched files, not just in diff hunks",
+)
+@click.option(
+    "--post",
+    is_flag=True,
+    help="Post inline review comments via gh CLI (non-idempotent — use workflow for dedup)",
+)
+@click.option(
+    "--repo",
+    default=None,
+    help="GitHub repo slug (owner/name) when --post is used; auto-detected via gh if omitted",
+)
+@click.option(
+    "--pr",
+    type=int,
+    default=None,
+    help="PR number to post to when --post is used; auto-detected via gh if omitted",
+)
+def pr_review(project_root, base, head, strict, post, repo, pr):
+    """Generate a Hefesto PR review for the current diff.
+
+    Default output is JSON on stdout, suitable for piping into the
+    deduped workflow template under examples/github-actions/. Use
+    ``--post`` to shell out to ``gh`` for a naïve non-idempotent post
+    (convenience mode for small repos; use the workflow template in
+    production so reruns don't duplicate comments).
+
+    Examples:
+        hefesto pr-review                                  # JSON to stdout
+        hefesto pr-review --strict                         # file-level findings too
+        hefesto pr-review --base main --head HEAD          # explicit refs
+        hefesto pr-review --post --pr 42 --repo owner/name # convenience post
+    """
+    import json
+    from pathlib import Path
+
+    from hefesto.pr_review.orchestrator import run_pr_review
+
+    try:
+        result = run_pr_review(
+            Path(project_root),
+            base=base,
+            head=head,
+            strict=strict,
+        )
+    except RuntimeError as exc:
+        click.echo(f"hefesto pr-review: {exc}", err=True)
+        _exit(1)
+        return
+
+    if not post:
+        click.echo(json.dumps(result.to_dict(), indent=2))
+        return
+
+    from hefesto.pr_review.post import detect_repo_and_pr, post_findings
+
+    if repo is None or pr is None:
+        detected_repo, detected_pr = detect_repo_and_pr(cwd=project_root)
+        repo = repo or detected_repo
+        pr = pr or detected_pr
+
+    if not repo or not pr:
+        click.echo(
+            "hefesto pr-review --post: --repo and --pr are required "
+            "(or must be detectable via gh)",
+            err=True,
+        )
+        _exit(1)
+        return
+
+    if not result.head_sha:
+        click.echo(
+            "hefesto pr-review --post: could not resolve head SHA for commit_id",
+            err=True,
+        )
+        _exit(1)
+        return
+
+    counters = post_findings(
+        repo=repo,
+        pr_number=pr,
+        commit_id=result.head_sha,
+        findings=result.findings,
+    )
+    click.echo(
+        f"Posted {counters['posted']} comment(s) "
+        f"({counters['failed']} failed, {counters['skipped_no_hunk']} skipped)"
+    )
+    if counters["failed"] > 0:
+        _exit(1)
+
+
 @cli.command()
 @click.option("--force", is_flag=True, help="Overwrite existing hooks")
 def install_hooks(force: bool):
@@ -515,28 +766,94 @@ def _install_hook(repo_root, hook_name, force):
         _exit(1)
 
 
-def _setup_analyzer_engine(severity, quiet):
+def _mount_iris_ingest(app):
+    """Mount IRIS Learning Risk Engine ingest endpoints if iris is installed.
+
+    Uses the same optional-import pattern as other PRO features.
+    Store selection: BigQueryStore when IRIS_BQ_PROJECT is set, else InMemoryStore.
+    """
+    try:
+        import os
+
+        from iris.core.ingest import create_ingest_router
+
+        if os.environ.get("IRIS_BQ_PROJECT"):
+            from iris.core.ingest import BigQueryStore
+
+            store = BigQueryStore(
+                project_id=os.environ["IRIS_BQ_PROJECT"],
+                dataset=os.environ.get("IRIS_BQ_DATASET", "omega_audit"),
+            )
+        else:
+            from iris.core.ingest import InMemoryStore
+
+            store = InMemoryStore()
+
+        router = create_ingest_router(store)
+        if router is not None:
+            app.include_router(router)
+            click.echo("  IRIS: ingest endpoints mounted (/v1/ingest/)")
+    except ImportError:
+        pass  # IRIS not installed — skip silently
+
+
+def _setup_analyzer_engine(severity, quiet, json_mode=False, scope_config=None, enrich_config=None):
     from hefesto.analyzers import (
         BestPracticesAnalyzer,
         CodeSmellAnalyzer,
         ComplexityAnalyzer,
+        NarrowSemanticAnalyzer,
         SecurityAnalyzer,
     )
     from hefesto.core.analyzer_engine import AnalyzerEngine
 
-    if not quiet:
+    # When json_mode, suppress verbose output so stdout stays clean
+    verbose = not quiet and not json_mode
+
+    if verbose:
         import click
 
         click.echo("")
 
     try:
-        engine = AnalyzerEngine(severity_threshold=severity, verbose=not quiet)
+        engine = AnalyzerEngine(
+            severity_threshold=severity,
+            verbose=verbose,
+            scope_config=scope_config,
+            enrich_config=enrich_config,
+            quiet=quiet,
+        )
 
         # Register all analyzers
         engine.register_analyzer(ComplexityAnalyzer())
         engine.register_analyzer(CodeSmellAnalyzer())
         engine.register_analyzer(SecurityAnalyzer())
         engine.register_analyzer(BestPracticesAnalyzer())
+
+        # EPIC 4: Resource Safety Pack v1
+        from hefesto.security.packs.resource_safety_v1 import ResourceSafetyAnalyzer
+
+        engine.register_analyzer(ResourceSafetyAnalyzer())
+
+        # Phase 4: Narrow Semantic checks (Python-only)
+        engine.register_analyzer(NarrowSemanticAnalyzer())
+
+        # Phase 1a: Operational Truth (project-level analyzers)
+        # Phase 1b: CiParityAnalyzer adapts validators/ci_parity into the pipeline
+        from hefesto.analyzers.operational_truth import (
+            CiParityAnalyzer,
+            DocsVsEntrypointsAnalyzer,
+            ImportsVsDepsAnalyzer,
+            InstallArtifactParityAnalyzer,
+            PackagingParityAnalyzer,
+        )
+
+        engine.register_project_analyzer(ImportsVsDepsAnalyzer())
+        engine.register_project_analyzer(DocsVsEntrypointsAnalyzer())
+        engine.register_project_analyzer(PackagingParityAnalyzer())
+        engine.register_project_analyzer(InstallArtifactParityAnalyzer())
+        engine.register_project_analyzer(CiParityAnalyzer())
+
         return engine
     except Exception as e:
         import click
@@ -556,10 +873,51 @@ def _run_analysis_loop(engine, paths_list, exclude_patterns):
         total_loc += report.summary.total_loc
         total_duration += report.summary.duration_seconds
 
-    return all_file_results, total_loc, total_duration
+    source_cache = getattr(engine, "source_cache", {})
+    return all_file_results, total_loc, total_duration, source_cache
 
 
-def _generate_report(all_file_results, total_loc, total_duration, output, save_html):
+def _run_ml_analysis(all_file_results, source_cache, quiet, json_mode):
+    """Run ML-powered semantic duplication analysis (OMEGA/PRO only)."""
+    import os
+
+    tier = os.environ.get("HEFESTO_TIER", "")
+    if tier not in ("professional", "omega"):
+        return
+    try:
+        from hefesto.analyzers.semantic_duplication import find_semantic_duplicates
+
+        if not quiet and not json_mode:
+            import click
+
+            click.echo("Running ML semantic analysis...", err=json_mode)
+        ml_issues, stats = find_semantic_duplicates(all_file_results, source_cache)
+        if ml_issues:
+            file_map = {fr.file_path: fr for fr in all_file_results}
+            for issue in ml_issues:
+                fr = file_map.get(issue.file_path)
+                if fr:
+                    fr.issues.append(issue)
+            if not quiet and not json_mode:
+                import click
+
+                click.echo(
+                    "   ML: {} functions, {} duplicates ({:.0f}ms)".format(
+                        stats["functions"], stats["pairs"], stats["duration_ms"]
+                    ),
+                    err=json_mode,
+                )
+        elif not quiet and not json_mode:
+            import click
+
+            click.echo("   ML: No semantic duplicates found", err=json_mode)
+    except Exception as e:
+        import logging
+
+        logging.getLogger(__name__).debug("ML analysis skipped: %s", e)
+
+
+def _generate_report(all_file_results, total_loc, total_duration, output, save_html, meta=None):
     from hefesto.core.analysis_models import AnalysisReport, AnalysisSummary
 
     # Get all issues from combined file results
@@ -582,6 +940,7 @@ def _generate_report(all_file_results, total_loc, total_duration, output, save_h
     combined_report = AnalysisReport(
         summary=combined_summary,
         file_results=all_file_results,
+        meta=meta or {},
     )
     return combined_report
 
@@ -591,11 +950,16 @@ def _print_report(combined_report, output, save_html, quiet, max_issues):
 
     from hefesto.reports import HTMLReporter, JSONReporter, TextReporter
 
+    json_mode = output == "json"
+
     # Apply max_issues limit if specified (affects display only)
     display_issues = combined_report.get_all_issues()
     if max_issues and len(display_issues) > max_issues:
         if not quiet:
-            click.echo(f"(Showing first {max_issues} of {len(display_issues)} issues)")
+            click.echo(
+                f"(Showing first {max_issues} of {len(display_issues)} issues)",
+                err=json_mode,
+            )
 
     # Generate output
     if output == "text":
@@ -618,9 +982,10 @@ def _print_report(combined_report, output, save_html, quiet, max_issues):
             click.echo(result)
 
 
-def _determine_exit_code(combined_report, fail_on, exclude_types, quiet):
+def _determine_exit_code(combined_report, fail_on, exclude_types, quiet, json_mode=False):
     import click
 
+    use_stderr = json_mode
     exit_code = 0
 
     if fail_on:
@@ -642,23 +1007,27 @@ def _determine_exit_code(combined_report, fail_on, exclude_types, quiet):
         for issue in gate_issues:
             issue_idx = severity_order.index(issue.severity.value)
             if issue_idx >= fail_on_idx:
-                exit_code = 2
+                exit_code = 1
                 break
 
-        if exit_code == 2 and not quiet:
-            click.echo(f"\nExit code: 2 (gate failure: {fail_on.upper()} or higher issues found)")
+        if exit_code == 1 and not quiet:
+            click.echo(
+                f"\nGate failure: {fail_on.upper()} or higher issues found (exit 1)",
+                err=use_stderr,
+            )
         elif not quiet:
             if excluded_types:
                 click.echo(
-                    f"\nExit code: 0 (no {fail_on.upper()}+ issues"
-                    f" after excluding {len(excluded_types)} type(s))"
+                    f"\nGate passed: no {fail_on.upper()}+ issues"
+                    f" after excluding {len(excluded_types)} type(s))",
+                    err=use_stderr,
                 )
             else:
-                click.echo(f"\nExit code: 0 (no {fail_on.upper()}+ issues)")
-    else:
-        # Default: exit 1 only for CRITICAL
-        if combined_report.summary.critical_issues > 0:
-            exit_code = 1
+                click.echo(
+                    f"\nGate passed: no {fail_on.upper()}+ issues",
+                    err=use_stderr,
+                )
+    # Without --fail-on: always exit 0 (findings reported in output, not via exit code)
 
     return exit_code
 
@@ -721,6 +1090,52 @@ def drift(template_file, region, stack_name, tags, fail_on):
             break
 
     sys.exit(exit_code)
+
+
+def _build_scope_config(
+    include_third_party, include_generated, include_fixtures, scope_allow, scope_deny
+):
+    """Build ScopeGatingConfig from CLI flags, or None if PRO unavailable."""
+    from hefesto.pro_optional import HAS_SCOPE_GATING, ScopeGatingConfig
+
+    if not HAS_SCOPE_GATING:
+        return None
+
+    return ScopeGatingConfig(
+        include_third_party=include_third_party,
+        include_generated=include_generated,
+        include_fixtures=include_fixtures,
+        allow_patterns=list(scope_allow),
+        deny_patterns=list(scope_deny),
+    )
+
+
+def _build_enrich_config(
+    enrich, enrich_provider, enrich_timeout, enrich_cache_ttl, enrich_cache_max
+):
+    """Build EnrichmentConfig from CLI flags, or None if off/unavailable."""
+    if enrich == "off":
+        return None
+
+    from hefesto.pro_optional import HAS_ENRICHMENT, EnrichmentConfig
+
+    if not HAS_ENRICHMENT or EnrichmentConfig is None:
+        click.echo("Warning: --enrich requires Hefesto PRO; enrichment will be skipped.", err=True)
+        return None
+
+    if not enrich_provider:
+        click.echo(
+            "Warning: enrichment enabled but no providers configured; will be skipped.", err=True
+        )
+
+    return EnrichmentConfig(
+        enabled=True,
+        local_only=(enrich == "local"),
+        timeout_seconds=float(enrich_timeout),
+        cache_ttl_seconds=enrich_cache_ttl,
+        cache_max_size=enrich_cache_max,
+        providers=list(enrich_provider),
+    )
 
 
 if __name__ == "__main__":

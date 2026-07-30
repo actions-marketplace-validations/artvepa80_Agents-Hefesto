@@ -43,6 +43,7 @@ class AnalysisIssueType(str, Enum):
     # Security
     HARDCODED_SECRET = "HARDCODED_SECRET"
     SQL_INJECTION_RISK = "SQL_INJECTION_RISK"
+    COMMAND_INJECTION = "COMMAND_INJECTION"
     EVAL_USAGE = "EVAL_USAGE"
     PICKLE_USAGE = "PICKLE_USAGE"
     ASSERT_IN_PRODUCTION = "ASSERT_IN_PRODUCTION"
@@ -110,6 +111,35 @@ class AnalysisIssueType(str, Enum):
     SQL_OVERLY_PERMISSIVE_GRANT = "SQL_OVERLY_PERMISSIVE_GRANT"
     SQL_DELETE_WITHOUT_WHERE = "SQL_DELETE_WITHOUT_WHERE"
     SQL_UPDATE_WITHOUT_WHERE = "SQL_UPDATE_WITHOUT_WHERE"
+
+    # COBOL Governance (v4.12.0 — Phase 1)
+    COBOL_GOTO_EXCESSIVE = "COBOL_GOTO_EXCESSIVE"
+    COBOL_HARDCODED_CREDENTIALS = "COBOL_HARDCODED_CREDENTIALS"
+    COBOL_ACCEPT_UNVALIDATED = "COBOL_ACCEPT_UNVALIDATED"
+    COBOL_REDEFINES_SENSITIVE = "COBOL_REDEFINES_SENSITIVE"
+    COBOL_OCCURS_DEPENDING_ON = "COBOL_OCCURS_DEPENDING_ON"
+    COBOL_PERFORM_THRU_CHAIN = "COBOL_PERFORM_THRU_CHAIN"
+    COBOL_COPYBOOK_BLAST_RADIUS = "COBOL_COPYBOOK_BLAST_RADIUS"
+
+    # Reliability Drift (EPIC 4 — Resource Safety Pack v1)
+    RELIABILITY_UNBOUNDED_GLOBAL = "RELIABILITY_UNBOUNDED_GLOBAL"
+    RELIABILITY_UNBOUNDED_CACHE = "RELIABILITY_UNBOUNDED_CACHE"
+    RELIABILITY_SESSION_LIFECYCLE = "RELIABILITY_SESSION_LIFECYCLE"
+    RELIABILITY_LOGGING_HANDLER_DUP = "RELIABILITY_LOGGING_HANDLER_DUP"
+    RELIABILITY_THREAD_IN_REQUEST = "RELIABILITY_THREAD_IN_REQUEST"
+
+    # Operational Truth (Phase 1a)
+    UNDECLARED_DEPENDENCY = "UNDECLARED_DEPENDENCY"
+    DOCS_ENTRYPOINT_DRIFT = "DOCS_ENTRYPOINT_DRIFT"
+    PACKAGING_VERSION_DRIFT = "PACKAGING_VERSION_DRIFT"
+    INSTALL_ARTIFACT_DRIFT = "INSTALL_ARTIFACT_DRIFT"
+
+    # CI Parity (Phase 1b — converged from hefesto/validators/ci_parity.py)
+    CI_CONFIG_DRIFT = "CI_CONFIG_DRIFT"
+
+    # Narrow Semantic (Phase 4)
+    ATTRIBUTE_NAME_MISMATCH = "ATTRIBUTE_NAME_MISMATCH"
+    SILENT_EXCEPTION_SWALLOW = "SILENT_EXCEPTION_SWALLOW"
 
     # Generic/External Provider
     EXTERNAL_FINDING = "EXTERNAL_FINDING"
@@ -205,6 +235,7 @@ class FileAnalysisResult:
     analysis_duration_ms: float
     language: Optional[str] = None
     provider_results: List[ProviderResult] = field(default_factory=list)
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary."""
@@ -218,6 +249,8 @@ class FileAnalysisResult:
             result["language"] = self.language
         if self.provider_results:
             result["providers"] = [pr.to_dict() for pr in self.provider_results]
+        if self.metadata:
+            result["file_meta"] = self.metadata
         return result
 
 
@@ -264,6 +297,8 @@ class AnalysisReport:
     ml_enabled: bool = False
     phase_0_enabled: bool = True
     phase_1_enabled: bool = False
+    # Optional metadata populated by PRO features (scope gating, multilang, etc.)
+    meta: Dict[str, Any] = field(default_factory=dict)
 
     def get_all_issues(self) -> List[AnalysisIssue]:
         """Get all issues across all files."""
@@ -282,11 +317,14 @@ class AnalysisReport:
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for JSON serialization."""
-        return {
+        result = {
             "summary": self.summary.to_dict(),
             "files": [file_result.to_dict() for file_result in self.file_results],
             "timestamp": self.timestamp.isoformat(),
         }
+        if self.meta:
+            result["meta"] = self.meta
+        return result
 
 
 __all__ = [
