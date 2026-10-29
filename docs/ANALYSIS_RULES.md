@@ -23,15 +23,26 @@
 **Description:** Functions with too many decision points become hard to understand, test, and maintain.
 
 **Detection Logic:**
-- Counts decision points: `if`, `while`, `for`, `and`, `or`, `elif`, `except`, `with`
-- Each decision point adds +1 to complexity score
+- Complexity = 1 + one point per decision point in the function body.
+- Python: each `if` and `elif` (an `elif` is a nested `if`), `for`, `async for`,
+  `while`, and each `try` statement (one point per `try`, however many `except`
+  clauses it has).
+- Not counted in Python: `and`, `or`, `with`, `except` clauses, conditional
+  expressions (`x if c else y`), comprehension loops and filters, `match`/`case`,
+  and `assert`.
+- Other languages: `if`, `switch`/`match`, loops, `try`, and `catch` clauses;
+  JavaScript and TypeScript also count conditional (`?:`) expressions.
+- A nested function's decision points also count toward the enclosing function,
+  and the nested function gets its own score.
+- The score is lower than tools such as radon, which also count boolean
+  operators: radon scores `if a and b and c:` as 3, Hefesto as 1.
 
 **Severity Levels:**
 - **MEDIUM:** Complexity 6-10
 - **HIGH:** Complexity 11-20
 - **CRITICAL:** Complexity 21+
 
-**Example - BAD (Complexity = 15):**
+**Example - BAD (Hefesto complexity = 12):**
 
 ```python
 def process_order(order, user, payment, shipping):
@@ -53,7 +64,7 @@ def process_order(order, user, payment, shipping):
     return False
 ```
 
-**Example - GOOD (Complexity = 4):**
+**Example - GOOD (Hefesto complexity = 5 for `process_order`, 1 for each helper):**
 
 ```python
 def process_order(order, user, payment, shipping):
@@ -106,6 +117,8 @@ def _validate_shipping(shipping):
 
 **Severity:** CRITICAL
 
+**CWE:** [CWE-798](https://cwe.mitre.org/data/definitions/798.html) (Use of Hard-coded Credentials). SARIF relationship kind `equal`. Tag `external/cwe/cwe-798`.
+
 **Description:** API keys, passwords, tokens hardcoded in source code.
 
 **Detection Patterns:**
@@ -151,6 +164,40 @@ if not STRIPE_API_KEY:
 - Difficult to rotate compromised keys
 - Compliance violations (PCI, SOC2, etc.)
 
+**Test and example code is skipped.** To reduce noise, this rule does not run
+on test or example code. Hefesto decides that from whole path segments and
+file-name conventions, never from substrings:
+
+- Skipped: files under a directory named exactly `test`, `tests`, `__tests__`,
+  `example` or `examples`; files named `test_*`, `*_test.<ext>`,
+  `*.test.<ext>`, `*.spec.<ext>`, `conftest.py`, `test.py` or `tests.py`; and
+  `*.example` templates such as `.env.example`.
+- Scanned: everything else, including paths that only *contain* those words,
+  such as `src/contest/config.py`, `latest_settings.py`, `latest_app/` or
+  `counterexample.py`, and `fixtures/` directories outside `tests/`.
+- Absolute paths are judged relative to the directory Hefesto runs from when
+  the file is inside it, so a checkout under `/home/me/tests/myrepo/` is not
+  treated as test code.
+
+Up to and including v4.14.0, any path containing the substring `test` or
+`example` was skipped (SEC-03).
+
+**Only three rules skip test paths.** The skip applies to this rule (Python
+hardcoded secrets, test and example paths), to
+[Assert in Production](#25-assert-in-production) (test paths only) and to
+`OT-IMPORTS-001` (`UNDECLARED_DEPENDENCY`), which does not scan Python files
+under any `tests/`, `test/`, `testing/`, `docs/`, `examples/` or `example/`
+directory (nor build, virtualenv and cache directories such as `build/`,
+`dist/`, `venv/`, `.venv/` or `node_modules/`), since test and docs
+dependencies are usually development-only. Every other rule still reports
+under `tests/`, including the secret rules for JSON, TOML
+and IaC files (for example `J001`, `T001` and `TF011`) and the rules of the
+DevOps, cloud and COBOL analyzers. This is on purpose: a real
+credential committed in a test fixture is still leaked. To leave test code out
+of a run, pass `--exclude tests/` or list it under `exclude` in
+`.hefesto.yaml` (entries are path segments, such as `tests/fixtures/`, not
+globs).
+
 ---
 
 ### 2.2 SQL Injection Risk
@@ -158,6 +205,8 @@ if not STRIPE_API_KEY:
 **Rule ID:** `SECURITY_002`
 
 **Severity:** CRITICAL
+
+**CWE:** [CWE-89](https://cwe.mitre.org/data/definitions/89.html) (SQL Injection). SARIF relationship kind `superset`: the check is line-based and does not track taint, so it finds a subset of CWE-89. Tag `external/cwe/cwe-89`.
 
 **Description:** Dynamic SQL queries vulnerable to SQL injection attacks.
 
@@ -200,6 +249,8 @@ def get_user(username):
 **Rule ID:** `SECURITY_003`
 
 **Severity:** CRITICAL
+
+**CWE:** [CWE-95](https://cwe.mitre.org/data/definitions/95.html) (Eval Injection). SARIF relationship kind `relevant`. Tag `external/cwe/cwe-95`.
 
 **Description:** Using `eval()` or `exec()` with untrusted input allows arbitrary code execution.
 
@@ -247,13 +298,15 @@ result = simple_eval(expression, functions={"abs": abs, "min": min})
 
 ---
 
-### 2.4 Unsafe Deserialization (pickle)
+### 2.4 Pickle import (PICKLE_USAGE)
 
-**Rule ID:** `SECURITY_004`
+**Rule ID:** `PICKLE_USAGE`
 
 **Severity:** HIGH
 
 **Description:** `pickle.load()` can execute arbitrary code during deserialization.
+
+**What Hefesto flags:** the `import pickle` / `import cPickle` / `from pickle import …` line. The `pickle.load()` call itself is not reported separately, and `yaml.load` is not detected.
 
 **Example - BAD:**
 
@@ -289,6 +342,8 @@ def load_data(filename):
 - Hard to detect malicious payloads
 - No safe way to unpickle untrusted data
 
+**CWE:** [CWE-502](https://cwe.mitre.org/data/definitions/502.html) (Deserialization of Untrusted Data). SARIF relationship kind `relevant`, and the rule precision is `low`. Hefesto flags the `import pickle` / `import cPickle` line only. The finding does not mean untrusted data was deserialized. Tag `external/cwe/cwe-502`.
+
 ---
 
 ### 2.5 Assert in Production
@@ -296,6 +351,8 @@ def load_data(filename):
 **Rule ID:** `SECURITY_005`
 
 **Severity:** MEDIUM
+
+**CWE:** none. [CWE-617](https://cwe.mitre.org/data/definitions/617.html) (Reachable Assertion) is about assertions that crash; this rule is about `assert` being removed by `python -O`. [CWE-703](https://cwe.mitre.org/data/definitions/703.html) is a Pillar and discouraged for mapping. SARIF emits no CWE tag and no relationship.
 
 **Description:** `assert` statements are removed when Python runs in optimized mode (`-O` flag).
 
@@ -330,6 +387,12 @@ def process_payment(amount, user):
 - Silent failures and unexpected behavior
 - Cannot rely on asserts for validation
 
+**Test code is skipped.** `assert` is expected in tests, so this rule does not
+run on test code, using the same path-segment rules as
+[Hardcoded Secrets](#21-hardcoded-secrets) (test directories and test
+file-name conventions only; example code *is* checked). Paths that merely
+contain `test`, such as `src/contest/app.py`, are checked.
+
 ---
 
 ### 2.6 Bare Except Clause
@@ -337,6 +400,8 @@ def process_payment(amount, user):
 **Rule ID:** `SECURITY_006`
 
 **Severity:** MEDIUM
+
+**CWE:** [CWE-396](https://cwe.mitre.org/data/definitions/396.html) (Declaration of Catch for Generic Exception). SARIF relationship kind `equal`. Tag `external/cwe/cwe-396`.
 
 **Description:** Catching all exceptions can hide bugs and security issues.
 
@@ -378,6 +443,27 @@ def process_data(data):
 - Debugging nightmares
 - Masks underlying issues
 - Program can't be interrupted
+
+---
+
+### 2.7 CWE in SARIF
+
+Python security rules carry a CWE in SARIF 2.1.0 from one mapping (`hefesto/reports/cwe_map.py`, CWE list 4.20, approved 2026-10-17). The same id is written two ways:
+
+- a rule tag `external/cwe/cwe-N`, which GitHub code scanning reads (no zero-padding, so CWE-89 is `cwe-89`);
+- a `run.taxonomies` entry named `CWE` (organization MITRE, version 4.20) and a `relationships` entry on the rule. The taxonomy lists only the ids used in that run.
+
+| Issue type | CWE | Relationship | Notes |
+|------------|-----|--------------|-------|
+| HARDCODED_SECRET | 798 | `equal` | Use of Hard-coded Credentials |
+| SQL_INJECTION_RISK | 89 | `superset` | Line-based; no taint tracking |
+| COMMAND_INJECTION | 78 | `superset` | OS command injection. Emitted by the security analyzer; no separate section above |
+| EVAL_USAGE | 95 | `relevant` | Eval Injection (`eval` / `exec`) |
+| PICKLE_USAGE | 502 | `relevant` | Precision `low`. Flags the `import pickle` / `cPickle` line only |
+| BARE_EXCEPT | 396 | `equal` | Declaration of Catch for Generic Exception |
+| ASSERT_IN_PRODUCTION | none | | No CWE. See [Assert in Production](#25-assert-in-production) |
+
+An issue field `metadata.cwe` overrides this table. COBOL rules that already set one keep the same tag text (`external/cwe/cwe-798`, `external/cwe/cwe-20`); those tags are not zero-padded.
 
 ---
 
@@ -1057,7 +1143,7 @@ Is it a minor style or documentation issue?
 | SECURITY_001 | Hardcoded Secrets | CRITICAL | Security |
 | SECURITY_002 | SQL Injection | CRITICAL | Security |
 | SECURITY_003 | eval() Usage | CRITICAL | Security |
-| SECURITY_004 | Unsafe Pickle | HIGH | Security |
+| PICKLE_USAGE | Pickle import | HIGH | Security |
 | SECURITY_005 | Assert in Production | MEDIUM | Security |
 | SECURITY_006 | Bare Except | MEDIUM | Security |
 | SMELL_001 | Long Function | MEDIUM-HIGH | Code Smells |
@@ -1105,15 +1191,26 @@ engine.register_analyzer(SecurityAnalyzer())
 # Skipped: CodeSmellAnalyzer, BestPracticesAnalyzer
 ```
 
-### Inline Suppressions
+### Excluding paths and issue types
 
-```python
-# hefesto: ignore
-API_KEY = "sk-test-123"  # Test key, not real
+Hefesto has no inline suppression comment: a `# hefesto: ignore` marker in
+the code is not read and changes nothing. Use these instead:
 
-# Or suppress specific rules (future feature)
-def long_function():  # hefesto: ignore SMELL_001
-    pass
+- `--exclude`: comma-separated path patterns that are not analyzed at all,
+  e.g. `hefesto analyze . --exclude tests/,docs/`.
+- `--exclude-types`: comma-separated issue types that do not fail the
+  `--fail-on` gate. The findings are still reported.
+  e.g. `hefesto analyze . --fail-on HIGH --exclude-types LONG_FUNCTION,VERY_HIGH_COMPLEXITY`.
+- `exclude` and `exclude_types` in `.hefesto.yaml` (or `.hefesto.yml`), the
+  config-file form of the two flags. Explicit flags win over the file.
+
+```yaml
+# .hefesto.yaml
+exclude:
+  - tests/
+  - docs/
+exclude_types:
+  - LONG_FUNCTION
 ```
 
 ---

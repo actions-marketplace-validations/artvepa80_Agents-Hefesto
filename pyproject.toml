@@ -1,14 +1,15 @@
 [build-system]
-requires = ["setuptools>=68.0", "wheel"]
+requires = ["setuptools>=77.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "hefesto-ai"
-version = "4.13.1"
-description = "AI-Powered Code Quality Guardian — Pre-commit security & complexity analysis in 0.01s"
+version = "4.20.4"
+description = "Release truth engine for AI-generated code: checks that what a project declares matches what it does, plus security and complexity analysis"
 readme = "README.md"
 requires-python = ">=3.10"
-license = {text = "MIT"}
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [
     {name = "Narapa LLC", email = "sales@narapallc.com"}
 ]
@@ -22,11 +23,12 @@ classifiers = [
     "Intended Audience :: Developers",
     "Topic :: Software Development :: Quality Assurance",
     "Topic :: Software Development :: Code Generators",
-    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Operating System :: OS Independent",
     "Typing :: Typed",
 ]
@@ -38,6 +40,7 @@ dependencies = [
     "radon>=6.0.1,<7.0.0",
     "mccabe>=0.7.0,<1.0.0",
     "jinja2>=3.1.2,<4.0.0",
+    "pyyaml>=6.0,<7.0",
 ]
 [project.optional-dependencies]
 server = [
@@ -56,6 +59,7 @@ lint = [
     "black==26.1.0",
     "flake8>=6.1.0",
     "isort==6.1.0",
+    "ruff>=0.8.0",
 ]
 dev = [
     "pytest>=7.4.0,<8.0.0",
@@ -66,6 +70,7 @@ dev = [
     "packaging>=23.0,<25.0",
     "tomli>=2.0.1,<3.0.0 ; python_version < '3.11'",
     "types-PyYAML>=6.0,<7.0",
+    "jsonschema>=4.17,<5",
 ]
 ml = [
     "numpy>=1.24.0,<3.0.0",
@@ -79,6 +84,10 @@ multilang = [
     # kreuzberg-dev/tree-sitter-language-pack#108 (closed; superseded by
     # 1.7.0) and #116 (open). 1.7.0+ is unaffected.
     "tree-sitter-language-pack>=1.0.0,!=1.6.3,<2.0",
+]
+# Optional: enables `hefesto analyze --format-check` (Black in check mode).
+format = [
+    "black>=24",
 ]
 ci = [
     "pyyaml>=6.0,<7.0",
@@ -123,6 +132,44 @@ multi_line_output = 3
 [tool.flake8]
 max-line-length = 100
 extend-ignore = ["E203", "W503"]
+
+# Local `ruff check` mirrors CI's `python -m flake8 hefesto tests`.
+# Flake8 reads `.flake8` (max-line-length 100, extend-ignore E203,W503) and
+# its own default ignore list. It does not read this [tool.flake8] table.
+# McCabe (C90) stays off: neither `.flake8` nor CI sets max-complexity.
+# https://docs.astral.sh/ruff/configuration/
+# https://docs.astral.sh/ruff/linter/
+# https://docs.astral.sh/ruff/faq/#how-does-ruffs-linter-compare-to-flake8
+# https://docs.astral.sh/ruff/settings/#extend-exclude
+# https://docs.astral.sh/ruff/settings/#lint_per-file-ignores
+# https://flake8.pycqa.org/en/latest/user/options.html#cmdoption-flake8-ignore
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+# CI lints only `hefesto` and `tests` (`python -m flake8 hefesto tests`).
+# `ruff check` with no paths walks the tree, so these directories are omitted:
+# Flake8 does not lint them, and they are not rewritten in this change.
+extend-exclude = [
+    "scripts",
+    "examples",
+]
+
+[tool.ruff.lint]
+select = [
+    "E",  # pycodestyle errors
+    "W",  # pycodestyle warnings
+    "F",  # Pyflakes
+]
+# Flake8's default `--ignore` is E121,E123,E126,E226,E24,E704,W503,W504.
+# `.flake8` adds E203 (and repeats W503) via extend-ignore.
+# Ruff only implements some of those codes. Ignore the ones it implements;
+# the rest cannot fire, so they are not listed (Ruff rejects unknown selectors).
+# Not implemented here: E121, E123, E126, E704, W503, W504.
+ignore = [
+    "E203",
+    "E226",
+    "E24",
+]
 
 [tool.mypy]
 python_version = "3.10"

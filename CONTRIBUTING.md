@@ -9,7 +9,7 @@ Thank you for your interest in contributing to Hefesto!
 - Submit PRs for bugs, features, docs
 - No CLA required for MIT-licensed code
 
-**Phase 1 (Pro - Commercial License)**:
+**Phase 1 (Pro - Commercial License, see [LICENSE-COMMERCIAL.md](LICENSE-COMMERCIAL.md))**:
 - Closed source, proprietary code
 - Bug reports welcome via GitHub Issues
 - Managed by Narapa LLC team
@@ -43,20 +43,41 @@ cd Agents-Hefesto
 python3.10 -m venv venv
 source venv/bin/activate  # On Windows: venv\Scripts\activate
 
-# Install in development mode
-pip install -e ".[dev]"
+# Install in development mode (the lint extra provides black, flake8, isort, ruff)
+pip install -e ".[dev,lint]"
 
 # Run tests
 pytest
 
-# Run linters
-black .
-isort .
-mypy hefesto/
+# Local pre-push checks (same commands as CI for guard, mypy, and flake8;
+# ruff enforces the flake8 rule set from pyproject.toml)
+python scripts/guard_public_repo.py
+ruff check
+python -m mypy hefesto --ignore-missing-imports
+python -m flake8 hefesto tests
+
+# Dogfood the Python files this change touches (this repo's CLI, hefesto-ai 4.20.4)
+HEFESTO_TELEMETRY=0 python -m hefesto analyze <changed.py> --severity LOW
+
+# Changed-file gate (CI: .github/workflows/dogfood.yml, job dogfood-hefesto).
+# ruff check --force-exclude (no --fix) on the changed .py files, then hefesto
+# on the changed files except those matching `exclude` in .hefesto.yaml
+# (path components, not globs; the script filters explicit paths itself, and
+# falls back to tests/fixtures/ and .github/action-smoke/ without the file):
+HEFESTO_TELEMETRY=0 python -m hefesto analyze <changed files> \
+  --severity medium --fail-on critical --allow-no-files
+# Proves a planted CRITICAL fails and the current hefesto/ tree has no
+# CRITICAL findings (the PostHog public key is reported as LOW).
+# One tracked file fails the gate when touched:
+# scripts/validate_aggregates_jsonl.py:48 (VERY_HIGH_COMPLEXITY, until split):
+python scripts/dogfood_changed.py --self-check
 
 # Verify version parity (pyproject.toml vs README, llms.txt, server.json,
 # agent-card.json, SKILL.md, copilot-instructions.md — also runs in CI)
 python scripts/verify_readme.py
+
+# Validate server.json against the official MCP registry schema (also in CI)
+python scripts/verify_server_json.py
 ```
 
 ## 📝 Code Style
@@ -66,6 +87,7 @@ python scripts/verify_readme.py
 - **Type hints**: Required for all public functions
 - **Docstrings**: Google style
 - **Testing**: pytest with >80% coverage
+- **Parsing analyzed Python**: call `hefesto.core.safe_parse.safe_parse` (or `parse_or_none`), never `ast.parse` directly. It keeps compiler warnings off stderr and makes the result independent of `PYTHONWARNINGS` / `-W`; `tests/test_safe_parse.py` fails on any other `ast.parse(` call under `hefesto/`.
 
 ## 🧪 Testing Requirements
 
@@ -73,8 +95,18 @@ All PRs must:
 - Include tests for new code
 - Maintain or improve coverage (currently 96%)
 - Pass all existing tests
-- Pass linters (black, isort, mypy)
-- Run local verification checks: `./scripts/run_checks.sh`
+- Pass linters (black, isort, ruff, flake8, mypy)
+- Run the local pre-push checks in Development Setup
+
+### Cursor agents and HefestoAI dogfooding
+
+`.cursor/mcp.json` registers the hosted `hefestoai` MCP server, and
+`.cursor/rules/hefesto-dogfood.mdc` (always applied) asks Cursor agents to analyze
+every changed file and report the result in the PR. Human contributors follow the
+same rule: run `HEFESTO_TELEMETRY=0 hefesto analyze <changed files>` and paste the
+command and output under a `Dogfood` heading in the PR body. Cloud agents only get
+the MCP server if it is added in cursor.com/agents (MCP dropdown) or
+Dashboard > Plugins & MCPs; otherwise they use the CLI.
 
 ## 📤 Pull Request Process
 
@@ -82,8 +114,14 @@ All PRs must:
 2. Create a feature branch (`git checkout -b feature/amazing-feature`)
 3. Make your changes
 4. Add tests
-5. Run test suite (`pytest`)
-6. Run linters (`black . && isort . && mypy hefesto/`)
+5. Run test suite (`HEFESTO_TELEMETRY=0 python -m pytest -q -m "not integration and not slow"`)
+6. Run the local pre-push checks:
+   `python scripts/guard_public_repo.py`
+   `ruff check`
+   `python -m mypy hefesto --ignore-missing-imports`
+   `python -m flake8 hefesto tests`
+   `HEFESTO_TELEMETRY=0 python -m hefesto analyze <changed files> --severity medium --fail-on critical --allow-no-files`
+   `python scripts/dogfood_changed.py --self-check`
 7. Commit (`git commit -m 'feat: Add amazing feature'`)
 8. Push (`git push origin feature/amazing-feature`)
 9. Open Pull Request
@@ -100,6 +138,8 @@ test: Add tests
 refactor: Refactor code
 chore: Update dependencies
 ```
+
+Co-author trailers: your own `Co-authored-by` lines for people who worked on the change are welcome. Commits made with the maintainer's tooling carry only `Co-authored-by: HefestoAI <noreply@narapallc.com>`. CI rejects commits whose author or co-author names an internal automation identity (`python scripts/guard_public_repo.py --check-commits origin/main..HEAD`).
 
 ## 🔒 Security
 

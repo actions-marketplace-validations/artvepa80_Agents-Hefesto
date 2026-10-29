@@ -1,4 +1,4 @@
-# Hefesto - AI Code Quality Guardian - Claude Code Guidelines
+# HefestoAI — release truth engine for AI-generated code — Claude Code Guidelines
 ## Enterprise Code Quality & Security Development Standards
 
 ---
@@ -15,6 +15,8 @@ On start of ANY task or session, the agent MUST read these files in order:
 4. `CHANGELOG.md` (recent changes, current version)
 5. `README.md` (public-facing docs, version badge, feature table)
 6. `task.md` and `walkthrough.md` (if present — task-specific context)
+
+Internal work logs and handoffs are kept outside this public repository; do not add them here (the guard rejects `docs/worklog/`).
 
 Do NOT skip this step. Do NOT guess project state from memory.
 
@@ -54,9 +56,11 @@ Do NOT skip this step. Do NOT guess project state from memory.
 After completing ANY non-trivial work:
 
 - [ ] Update impacted docs (at minimum `CHANGELOG.md`; `README.md` if version/features changed).
-- [ ] Run repo verification: `source venv/bin/activate && black --check hefesto/ tests/ && isort --check hefesto/ tests/ && flake8 hefesto/ tests/ && pytest tests/ -q`
-- [ ] Commit with Conventional Commits format, then push the branch.
-- [ ] Never move/delete tags without explicit user approval.
+- [ ] Run repo verification (the CI `lint-and-test` steps in the same order, with `pip install -e ".[dev,lint]"`; the "Check Docs Emails" grep step of CI is left out here): `python scripts/guard_public_repo.py && ruff check && python -m mypy hefesto --ignore-missing-imports && python -m black --check hefesto tests && python -m isort --check-only hefesto tests && python -m flake8 hefesto tests && python scripts/verify_capabilities.py && python scripts/verify_readme.py && python scripts/verify_server_json.py && HEFESTO_TELEMETRY=0 python -m pytest -q -m "not integration and not slow"`
+- [ ] The changed-file gate is `.github/workflows/dogfood.yml` (`dogfood-hefesto`), on pull requests against the base commit and on pushes to `main`. It runs `python -m ruff check --force-exclude` (no `--fix`) on changed `.py` files, so `[tool.ruff]` `extend-exclude` applies, then `HEFESTO_TELEMETRY=0 python -m hefesto analyze <changed files> --severity medium --fail-on critical --allow-no-files`. `python scripts/dogfood_changed.py --self-check` must pass: a planted CRITICAL fails, and `hefesto/` has no CRITICAL findings (the PostHog public key at `hefesto/telemetry/client.py:28` is reported as LOW, known public client key). There is no line-level suppression; do not drop `HARDCODED_SECRET` globally. Changed files matching `exclude` in `.hefesto.yaml` are not gated; the script applies that list itself with the engine's `path_is_excluded` (the CLI does not filter explicit paths). Patterns are whole path components, not globs. Without the file it falls back to `tests/fixtures/` and `.github/action-smoke/` (planted findings) and logs that. With those exclusions, one tracked file fails this gate when touched: `scripts/validate_aggregates_jsonl.py:48` (CRITICAL `VERY_HIGH_COMPLEXITY`, cyclomatic complexity 22) until that function is split.
+- [ ] Commit with Conventional Commits format, then push the branch. Commits made with the maintainer's tooling use the maintainer's GitHub noreply address as author and carry only the trailer `Co-authored-by: HefestoAI <noreply@narapallc.com>`; no other tool or automation co-author trailers (CI checks the PR's commits with `python scripts/guard_public_repo.py --check-commits <base>..<head>`).
+- [ ] Never run a destructive or irreversible operation without Arturo's explicit OK first, every time: moving or deleting tags; deleting or archiving repositories, branches, releases or tags; changing repository visibility. Do not request broader token scopes (e.g. `delete_repo`) to get around a refusal; stop and ask. For tags, the single exception is the tag `v4`, the floating alias of the 4.x line used as `artvepa80/Agents-Hefesto@v4`, which `release.yml` force-moves to each new v4.x.y release. No other tag moves: not exact version tags (`v4.15.1`, ...), and no other alias exists or may be created without explicit approval.
+- [ ] PR head branches are deleted by the repository's auto-delete setting when a PR is merged; Arturo's merge OK covers that. Never delete a branch by hand without explicit OK.
 - [ ] Update `MEMORY.md` if project status changed (new blockers, resolved items, version bumps).
 
 ### PyPI Publishing Rule
@@ -76,7 +80,7 @@ After completing ANY non-trivial work:
 ### Deployment
 - Paquete PyPI: `hefesto-ai`
 - Comando de instalación: `pip install hefesto-ai[pro]` o `pip install hefesto-ai[omega]`
-- Publicación: `python3 -m build && twine upload dist/*`
+- Publicación: push a `vX.Y.Z` tag; `release.yml` builds and publishes to PyPI with Trusted Publishing (OIDC) after the required review on the `pypi` environment. No `twine upload`, no API tokens.
 
 ### Estructura del Proyecto
 - **Core**: `/hefesto/core/` (engine, scanner)
@@ -91,14 +95,15 @@ After completing ANY non-trivial work:
 
 ### URLs de Producción
 - PyPI: https://pypi.org/project/hefesto-ai/
-- Stripe PRO: https://buy.stripe.com/4gM00i6jE6gV3zE4gg
-- Stripe OMEGA: https://buy.stripe.com/14A9AS23o20Fgmqb5Q
+- Pricing / checkout: https://hefestoai.narapallc.com/#pricing (PRO $8/mo, OMEGA $19/mo)
+- Stripe PRO: https://buy.stripe.com/4gM00i6jE6gV3zE4HseAg0b
+- Stripe OMEGA: https://buy.stripe.com/14A9AS23o20Fgmqb5QeAg0c
 - GitHub: https://github.com/artvepa80/Agents-Hefesto
 
 ### Estilo de Código
 - Formatter: `black` (line-length: 100)
 - Import sorting: `isort`
-- Type checking: `mypy --strict`
+- Type checking: `python -m mypy hefesto --ignore-missing-imports` (what CI runs)
 - Linting: `flake8`
 - No emojis en código (solo en docs de marketing)
 
@@ -112,15 +117,18 @@ These rules ensure Hefesto achieves enterprise-grade quality, maintainability, s
 
 **Mission**: Build the most trusted release truth engine for AI-generated code. We dogfood the gate against our own code on every push to main; gate-internals refactor history is documented in the private repo.
 
-**Current Status (v4.13.0)**:
+**CI scans of this repo:** `.github/workflows/hefesto.yml` (job `hefesto-scan`) scans the whole repo on push and PR to `main` with the Action `@v4` (`fail_on: CRITICAL`) and uploads SARIF to code scanning (category `hefesto`). It is non-blocking (`continue-on-error: true`) until the two known CRITICAL findings are fixed; the blocking gate on changed files is `dogfood.yml`. Excludes live only in the root `.hefesto.yaml` (`tests/fixtures/`, `.github/action-smoke/`). `exclude` entries are whole path segments, not globs (`tests/fixtures/**` matches nothing), and paths passed explicitly are not filtered.
+
+**Current Status (v4.20.4)**:
 - 3-tier licensing (FREE/PRO/OMEGA)
 - 2 core REST endpoints (/health, /analyze) in hefesto/server.py. IRIS ingest sub-router (/v1/ingest/*) mounted conditionally when OMEGA tier is installed
-- BigQuery integration
 - IRIS Agent production monitoring
 - 507 tests passing (CI green)
 - 22 language/format analyzers
 - Self-validated (dogfooding successful)
 - GitHub Release automation (hardened workflow)
+- Anonymous PostHog usage events, on by default, with opt-out (`hefesto telemetry disable`, `HEFESTO_TELEMETRY=0`, `DO_NOT_TRACK=1`); `hefesto init`; PyPI newer-version notice
+- CLI PRO/OMEGA notices (one stderr line; `HEFESTO_NO_UPSELL=1` hides them). `hefesto info` prints only the plans line
 
 ---
 
@@ -256,7 +264,7 @@ def test_benchmark_against_known_bugs():
 ### 🔧 **Automated Validation**
 - **G-1 (MUST)** `pytest --cov=90` coverage minimum
 - **G-2 (MUST)** `black --check` and `isort --check` formatting passes
-- **G-3 (MUST)** `mypy --strict` type checking passes
+- **G-3 (MUST)** `python -m mypy hefesto --ignore-missing-imports` passes (the blocking mypy step of CI `lint-and-test`; `--strict` is not enforced)
 - **G-4 (MUST)** `flake8` linting passes
 - **G-5 (MUST)** Self-validation passes (run Hefesto on itself)
 - **G-6 (MUST)** No `exec()` or `eval()` usage without explicit security review
@@ -287,6 +295,31 @@ test(analyzers): add empirical complexity validation
 - **GH-5 (MUST)** Version bumps follow semver strictly
 - **GH-6 (MUST)** Include changelog entry for every release
 - **GH-7 (MUST)** Run dogfooding validation before publishing to PyPI
+- **GH-8 (MUST)** No same-day merge for runtime changes. A PR that changes runtime behaviour is not merged on the calendar day (America/Lima) it was opened. Runtime paths in this repo:
+  - code under `hefesto/`;
+  - `action.yml` and `scripts/action_entrypoint.sh` (the GitHub Action runs that script);
+  - `Dockerfile.action` (it builds the Action image that `@v4` users can run);
+  - the guards and verifiers that decide pass or fail: `scripts/guard_*.py` and `scripts/verify_*.py`;
+  - dependency pins in `pyproject.toml`, `requirements.txt`, `requirements-dev.txt`, or any lockfile outside `tests/fixtures/`;
+  - `.github/workflows/`.
+
+  Exempt (may merge the day they are opened):
+  - docs-only PRs;
+  - test-only PRs (changes only under `tests/`);
+  - CI-only scripts under `scripts/` that are not guards or verifiers (benchmarks, corpus and recall tools, `scripts/git-hooks/`, `run_checks.sh`, `prepush_gate.sh`);
+  - version-bump-only PRs, only when the diff is version strings plus `CHANGELOG.md`. Anything else in the diff makes it a runtime PR.
+
+  A PR that touches both an exempt path and a runtime path is a runtime PR. The only exception is Arturo's explicit OK for that PR, recorded in the PR body as:
+  `Same-day merge exception: approved by Arturo on YYYY-MM-DD. Reason: <one line>.`
+  A same-day merge of a runtime PR without that line is a violation, not an exception. The rule is checkable from GitHub data alone: the PR's `created_at` and `merged_at` converted to America/Lima, its changed files, and the exception line in its body.
+
+### Ruleset incident procedure
+If infrastructure (not the change under review) breaks a required check of the `main` ruleset (15985908) so that a fix cannot merge:
+1. Get Arturo's explicit OK before touching the ruleset.
+2. Set the ruleset enforcement to disabled.
+3. Merge the fix PR (squash).
+4. Re-enable the ruleset right away and confirm it is active with the same required checks.
+5. Log it in the internal work log (kept outside this repository): time (Lima), reason, PR, who approved, and when enforcement was restored.
 
 ---
 
@@ -392,14 +425,13 @@ The full audit and refactor history are tracked internally in our private repo. 
 - CLI commands
 - Pre-push hooks
 
-### PRO Tier ($8/month)
+### PRO Tier ($8/mo per user)
 - SemanticAnalyzer (AI/ML)
 - Advanced security scanning
-- REST API (8 endpoints)
-- BigQuery integration
+- REST API (2 endpoints: `GET /health`, `POST /analyze`; see docs/rest-api.md)
 - Duplicate detection
 
-### OMEGA Guardian ($19/month)
+### OMEGA Guardian ($19/mo)
 - Everything in PRO
 - IRIS Agent (production monitoring)
 - HefestoEnricher (auto-correlation)
@@ -447,7 +479,7 @@ pytest tests/ --cov=hefesto --cov-report=html
 # Quality gates
 black --check hefesto/ tests/
 isort --check hefesto/ tests/
-mypy hefesto/ --strict
+python -m mypy hefesto --ignore-missing-imports
 flake8 hefesto/ tests/
 
 # Dogfooding
@@ -464,19 +496,48 @@ Releases are automated via GitHub Actions:
     git tag v4.7.1-rc.1
     git push origin v4.7.1-rc.1
     ```
+    The workflow builds the sdist and wheel, runs `twine check`, then publishes
+    with PyPI Trusted Publishing (OIDC): environment `testpypi`,
+    `pypa/gh-action-pypi-publish` pinned to a release tag, repository
+    `https://test.pypi.org/legacy/`. Authentication is the GitHub OIDC token
+    for that environment; There is no `TEST_PYPI_API_TOKEN`.
+    The GitHub environment `testpypi` must exist under repository Settings →
+    Environments (the name registered on the TestPyPI pending publisher).
+    Production publishes go through `release.yml` (item 2).
 
 2.  **PyPI (Production)**
     ```bash
     # Update version in pyproject.toml FIRST
-    # Push final tag (triggers release.yml + Cloud Run Prod)
+    # Push final tag (triggers release.yml)
     git tag v4.7.1
     git push origin v4.7.1
     ```
+    The workflow builds the sdist and wheel, runs `twine check`, then publishes
+    with PyPI Trusted Publishing (OIDC): environment `pypi`,
+    `pypa/gh-action-pypi-publish` pinned to a release tag. The action's default
+    repository is PyPI; attestations stay at the action default (PEP 740).
+    Authentication is the GitHub OIDC token for that environment;
+    there is no `PYPI_API_TOKEN`. The GitHub environment `pypi` (the name
+    registered on the PyPI trusted publisher) has the maintainer as required
+    reviewer, so every production publish waits for that approval.
+    Release-candidate publishes go through `release-testpypi.yml` (item 1).
 
 3.  **GitHub Release** (automatic)
-    - The hardened `release.yml` now creates GitHub Releases automatically on tag push.
+    - `release.yml` creates the GitHub Release after the PyPI publish job succeeds.
     - Build artifacts (wheel + sdist) are attached to the release.
-    - If PyPI publish fails (e.g., email verification pending), the release is still created.
+    - A failed publish fails the workflow. The GitHub Release is not created and
+      the floating `v4` tag is not moved.
+
+4.  **Tag `v4`, floating alias of the 4.x line** (automatic)
+    - The last step of `release.yml` force-moves the lightweight tag `v4` to the commit of a
+      new `v4.x.y` tag, only when it is the highest `v4.x.y` tag (an older patch never moves it
+      back). Users write `uses: artvepa80/Agents-Hefesto@v4`.
+    - `v4` is the ONLY tag that moves. Never retag or delete an exact version tag.
+    - `v4` follows minors too, so `@v4` users get behaviour changes (e.g. exit codes) on the
+      next release: open those release notes with the change.
+    - `release.yml` does not run for `v4` itself (`!v4` filter).
+    - Manual fallback if that step fails:
+      `git tag -f v4 v4.X.Y^{commit} && git push -f origin refs/tags/v4`.
 
 ---
 

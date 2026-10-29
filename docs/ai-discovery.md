@@ -1,6 +1,6 @@
 # HefestoAI: AI Code Guardrails (Pre-commit + MCP)
 
-HefestoAI is a pre-commit code quality guardian designed for workflows where AI assistants generate or modify production code. It detects semantic drift, risky diffs, and violations of release policies before changes are merged.
+HefestoAI is a release truth engine for AI-generated code, designed for workflows where AI assistants generate or modify production code. It detects semantic drift, risky diffs, and violations of release policies before changes are merged.
 
 ## Typical Workflows
 
@@ -33,6 +33,7 @@ Semantic drift is when a change still compiles and tests pass, but the change si
 | Integration | Protocol | Endpoint |
 |-------------|----------|----------|
 | MCP Server | JSON-RPC 2.0 (streamable-http) | `/api/mcp-protocol` |
+| Hosted analysis | HTTP POST (20 files, 100 KB each, 20 s; nothing stored) | `/api/analyze` |
 | REST Discovery | HTTP GET/POST | `/api/mcp` |
 | OpenAPI | OpenAPI 3.0 spec | `/api/openapi.json` |
 | Natural Language Q&A | HTTP POST | `/api/ask` |
@@ -55,4 +56,7 @@ npx @smithery/cli@latest mcp add artvepa80/hefestoai
 ## Registry Listings
 
 - **Official MCP Registry:** `io.github.artvepa80/hefestoai` (ACTIVE)
+- **Cursor:** root `.mcp.json` (read by cursor.directory) and the README "Add to Cursor" button (`https://cursor.com/link/mcp/install?name=hefestoai&config=…`). Listing on cursor.directory is a separate submission by the repository owner.
 - **Smithery:** `artvepa80/hefestoai` (PUBLIC)
+
+The hosted MCP server is closed-source and operated by Narapa LLC. The registry `repository` is this public repository, which contains the open-source `hefesto-ai` engine that `analyze` runs. Publishing a new registry version is a manual workflow; see [mcp-registry.md](mcp-registry.md).

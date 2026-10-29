@@ -9,9 +9,14 @@ Copyright 2025 Narapa LLC, Miami, Florida
 """
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Dict, List, Literal, Optional
+
+
+def _utc_now_naive() -> datetime:
+    """Current UTC time as a naive datetime, same as the deprecated utcnow()."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 class AnalysisIssueSeverity(str, Enum):
@@ -53,6 +58,9 @@ class AnalysisIssueType(str, Enum):
     MISSING_DOCSTRING = "MISSING_DOCSTRING"
     POOR_NAMING = "POOR_NAMING"
     STYLE_VIOLATION = "STYLE_VIOLATION"
+
+    # Formatting (opt-in via --format-check)
+    FORMAT_DRIFT = "FORMAT_DRIFT"
 
     # YAML Issues (v4.4.0)
     YAML_SYNTAX_ERROR = "YAML_SYNTAX_ERROR"
@@ -120,6 +128,15 @@ class AnalysisIssueType(str, Enum):
     COBOL_OCCURS_DEPENDING_ON = "COBOL_OCCURS_DEPENDING_ON"
     COBOL_PERFORM_THRU_CHAIN = "COBOL_PERFORM_THRU_CHAIN"
     COBOL_COPYBOOK_BLAST_RADIUS = "COBOL_COPYBOOK_BLAST_RADIUS"
+    COBOL_HARDCODED_SECRET_VALUE = "COBOL_HARDCODED_SECRET_VALUE"
+    COBOL_CONNECTION_STRING_SECRET = "COBOL_CONNECTION_STRING_SECRET"
+    COBOL_SQL_CONNECT_LITERAL_CREDENTIAL = "COBOL_SQL_CONNECT_LITERAL_CREDENTIAL"
+    COBOL_FILE_STATUS_MISSING = "COBOL_FILE_STATUS_MISSING"
+    COBOL_FILE_STATUS_UNCHECKED = "COBOL_FILE_STATUS_UNCHECKED"
+    COBOL_DEAD_CODE = "COBOL_DEAD_CODE"
+    COBOL_UNUSED_PARAGRAPH = "COBOL_UNUSED_PARAGRAPH"
+    COBOL_COPYBOOK_NOT_FOUND = "COBOL_COPYBOOK_NOT_FOUND"
+    COBOL_PLATFORM_DEPENDENT_LAYOUT = "COBOL_PLATFORM_DEPENDENT_LAYOUT"
 
     # Reliability Drift (EPIC 4 — Resource Safety Pack v1)
     RELIABILITY_UNBOUNDED_GLOBAL = "RELIABILITY_UNBOUNDED_GLOBAL"
@@ -155,6 +172,8 @@ class AnalysisIssue:
     - rule_id: External rule ID (SC2086, DL3000, etc.)
     - confidence: Detection confidence (0.0-1.0)
     - source: Code context (code, string_literal, template_literal, comment)
+
+    end_line: last line of the function for function-level findings.
     """
 
     file_path: str
@@ -173,6 +192,12 @@ class AnalysisIssue:
     rule_id: Optional[str] = None
     confidence: Optional[float] = None
     source: Optional[Literal["code", "string_literal", "template_literal", "comment"]] = None
+
+    # Last line of the reported construct for function-level findings
+    # (complexity, long function, deep nesting), whose ``line`` is the
+    # ``def`` line. ``hefesto pr-review`` uses it to tell whether a diff
+    # hunk touches the function. Not part of ``to_dict``.
+    end_line: Optional[int] = None
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for JSON serialization."""
@@ -291,7 +316,7 @@ class AnalysisReport:
 
     summary: AnalysisSummary
     file_results: List[FileAnalysisResult]
-    timestamp: datetime = field(default_factory=datetime.utcnow)
+    timestamp: datetime = field(default_factory=_utc_now_naive)
     # Enterprise/Pro fields
     license_tier: str = "COMMUNITY"
     ml_enabled: bool = False

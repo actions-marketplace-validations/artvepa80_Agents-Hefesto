@@ -2,7 +2,7 @@
 
 ## What is Hefesto?
 
-Hefesto (hefesto-ai on PyPI) is an AI-powered static analysis tool designed specifically for validating AI-generated code. It catches security flaws, semantic drift, and complexity issues that traditional linters miss — in 0.01s across 22 formats.
+Hefesto (hefesto-ai on PyPI) is a release truth engine for AI-generated code. Before merge, it checks that what a project declares matches what it actually does, and it catches security flaws, semantic drift, and complexity issues. The package ships analyzers for 22 formats.
 
 ## The Problem Hefesto Solves
 
@@ -20,31 +20,33 @@ hefesto/
 ├── cli/main.py              — CLI entry point (analyze, serve, install-hooks)
 ├── core/
 │   ├── analyzer_engine.py    — Central engine: loads analyzers, runs analysis
-│   ├── scanner.py            — File discovery + language detection
-│   └── languages/            — Per-language AST parsers
+│   ├── language_detector.py  — Language detection from extensions, names, and shebangs
+│   └── languages/            — Language specs and registry
 ├── analyzers/
 │   ├── complexity.py         — Cyclomatic/cognitive complexity
-│   ├── semantic.py           — AI semantic analysis (PRO)
-│   ├── duplicates.py         — Code duplication detection (PRO)
+│   ├── narrow_semantic.py    — Attribute-name and swallowed-exception checks
+│   ├── semantic_duplication.py — Duplicate-code detection (embeddings)
+│   ├── security.py           — HARDCODED_SECRET, SQL_INJECTION_RISK, COMMAND_INJECTION, PICKLE_USAGE
 │   ├── cloud/                — CloudFormation, ARM, Helm, Serverless
 │   └── devops/               — Docker, Terraform, Shell, YAML, SQL, PowerShell
 ├── security/
-│   ├── vulnerability.py      — HARDCODED_SECRET, SQL_INJECTION, COMMAND_INJECTION
+│   ├── masking.py            — Secret masking for logs
+│   ├── path_sandbox.py       — Path checks
 │   └── packs/                — Security rule packs
-├── api/                      — REST API server (PRO)
-├── omega/                    — IRIS production monitoring (OMEGA)
-└── licensing/                — 3-tier: FREE/PRO/OMEGA
+└── server.py                 — REST API (GET /health, POST /analyze)
 ```
+
+PRO and OMEGA features ship in the private distribution, not in this tree.
 
 ## Key Facts
 
-- **Version:** 4.13.1
+- **Version:** 4.20.4
 - **Tests:** 531 across 38 test files
 - **Languages:** Python (native AST), TypeScript, JavaScript, Java, Go, Rust, C# (TreeSitter — requires `pip install "hefesto-ai[multilang]"`)
-- **DevOps:** YAML, Terraform, Shell, Dockerfile, SQL, PowerShell, JSON, TOML, Makefile, Groovy
+- **DevOps:** YAML, Terraform, Shell, Dockerfile, SQL, COBOL, PowerShell, JSON, TOML, Makefile, Groovy
 - **Cloud:** CloudFormation, ARM Templates, Helm Charts, Serverless Framework
 - **PyPI:** `pip install hefesto-ai`
-- **GitHub Action:** `artvepa80/Agents-Hefesto@v4.13.1`
+- **GitHub Action:** `artvepa80/Agents-Hefesto@v4` (floating major tag; exact pins such as `@v4.20.4` also work)
 - **MCP Server:** Registered in Smithery (AI agent ecosystem)
 - **License:** MIT (core), proprietary (PRO/OMEGA features)
 
@@ -67,7 +69,7 @@ hefesto analyze .
 hefesto analyze . --fail-on HIGH --output json
 
 # GitHub Action
-- uses: artvepa80/Agents-Hefesto@v4.13.1
+- uses: artvepa80/Agents-Hefesto@v4
   with:
     target: '.'
     fail_on: 'CRITICAL'
@@ -76,7 +78,7 @@ hefesto analyze . --fail-on HIGH --output json
 ## Differentiators vs Competition
 
 - **vs Semgrep/Bandit:** Hefesto validates AI-generated code intent, not just patterns
-- **vs SonarQube:** No server required, 0.01s speed, $8 vs $15K+/year
+- **vs SonarQube:** No server required, local runs
 - **vs all:** Only SAST tool with MCP server integration for AI agent workflows
 - **Dogfooding:** Found 3 critical bugs in its own v4.0.1 release
 

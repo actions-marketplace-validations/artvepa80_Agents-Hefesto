@@ -13,9 +13,10 @@ Copyright © 2025 Narapa LLC, Miami, Florida
 """
 
 import logging
+import os
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from hefesto.core.analysis_models import (
     AnalysisIssue,
@@ -24,6 +25,7 @@ from hefesto.core.analysis_models import (
     AnalysisSummary,
     FileAnalysisResult,
 )
+from hefesto.core.config_parse import parse_scope
 from hefesto.core.language_detector import Language, LanguageDetector
 from hefesto.core.languages.registry import get_registry
 from hefesto.core.parsers.parser_factory import ParserFactory
@@ -31,7 +33,13 @@ from hefesto.core.parsers.parser_factory import ParserFactory
 logger = logging.getLogger(__name__)
 
 # Directories excluded by default to avoid noise from vendored/generated code.
-# Users can add more via --exclude; these are always applied unless --no-default-excludes.
+# Users can add more via --exclude; these are always applied.
+COBOL_INFERRED_FREE_NOTICE = (
+    "Read as free-format COBOL because a division header or level-01/77 entry starts "
+    "before column 8 and there is no >>SOURCE FORMAT directive. Add the directive "
+    "if this is wrong."
+)
+
 DEFAULT_EXCLUDES = [
     ".venv/",
     "venv/",
@@ -45,7 +53,189 @@ DEFAULT_EXCLUDES = [
     ".pytest_cache/",
     ".eggs/",
     ".egg-info/",
+    # Generated lockfiles. A directory walk skips the filename. Naming the
+    # file on the command line still analyzes it (the single-file branch
+    # does not apply these patterns).
+    "package-lock.json",
+    "npm-shrinkwrap.json",
+    "composer.lock",
+    "poetry.lock",
+    "Cargo.lock",
+    "uv.lock",
+    "Pipfile.lock",
+    "packages.lock.json",
+    "flake.lock",
+    "deno.lock",
+    "bun.lock",
 ]
+
+# Analyzers that take (path, content) and return AnalysisIssue.
+_TEXT_ANALYZERS = {
+    Language.POWERSHELL: (
+        "hefesto.analyzers.devops.powershell_analyzer",
+        "PowerShellAnalyzer",
+    ),
+    Language.JSON: ("hefesto.analyzers.devops.json_analyzer", "JsonAnalyzer"),
+    Language.TOML: ("hefesto.analyzers.devops.toml_analyzer", "TomlAnalyzer"),
+    Language.MAKEFILE: (
+        "hefesto.analyzers.devops.makefile_analyzer",
+        "MakefileAnalyzer",
+    ),
+    Language.GROOVY: (
+        "hefesto.analyzers.devops.groovy_jenkins_analyzer",
+        "GroovyJenkinsAnalyzer",
+    ),
+}
+
+# Cloud analyzers take (content, path) and return CloudFinding.
+_CLOUD_ANALYZERS = {
+    Language.CLOUDFORMATION: (
+        "hefesto.analyzers.cloud.cloudformation",
+        "CloudFormationAnalyzer",
+    ),
+    Language.ARM: ("hefesto.analyzers.cloud.arm", "ArmAnalyzer"),
+    Language.HELM: ("hefesto.analyzers.cloud.helm", "HelmAnalyzer"),
+    Language.SERVERLESS: (
+        "hefesto.analyzers.cloud.serverless",
+        "ServerlessAnalyzer",
+    ),
+}
+
+
+def _pattern_parts(pattern: str) -> Tuple[List[str], bool]:
+    """Components of an exclude pattern and whether it only names directories."""
+    text = pattern.strip().replace("\\", "/")
+    while text.startswith("./"):
+        text = text[2:]
+    return [part for part in text.split("/") if part], text.endswith("/")
+
+
+def path_is_excluded(
+    rel_parts: Sequence[str], patterns: Iterable[str], is_dir: bool = False
+) -> bool:
+    """True if a path below the analysis root matches an exclude pattern.
+
+    ``rel_parts`` are the components of the path relative to the analysis
+    root, so directories above the root never match. A pattern is a sequence
+    of whole components: ``build/`` matches a ``build`` directory at any
+    depth (not ``rebuild/``), ``src/legacy/`` matches those two consecutive
+    directories, ``evil.py`` matches a file or directory with that name. A
+    trailing ``/`` restricts the pattern to directories; set ``is_dir`` when
+    ``rel_parts`` names a directory. ``.egg-info/`` matches directories whose
+    name ends with ``.egg-info`` (``pkg.egg-info/``).
+    """
+    parts = tuple(rel_parts)
+    for pattern in patterns:
+        wanted, dir_only = _pattern_parts(pattern)
+        if not wanted:
+            continue
+        candidates = parts if (is_dir or not dir_only) else parts[:-1]
+        size = len(wanted)
+        for start in range(len(candidates) - size + 1):
+            window = candidates[start : start + size]
+            if all(_component_matches(name, want) for name, want in zip(window, wanted)):
+                return True
+    return False
+
+
+def _component_matches(name: str, wanted: str) -> bool:
+    if wanted in _SUFFIX_EXCLUDES:
+        return name.endswith(wanted) and name != wanted
+    return name == wanted
+
+
+# Default excludes that name a suffix of a directory (``pkg.egg-info``).
+_SUFFIX_EXCLUDES = frozenset({".egg-info"})
+
+
+# Vendored and minified JavaScript, skipped by default (``--include-vendored``
+# analyzes it). Only JavaScript files are affected; a Go or PHP ``vendor/``
+# tree stays in scope.
+_JS_SUFFIXES = (".js", ".mjs", ".cjs")
+# Directories that only ever hold copied or installed third-party packages.
+_VENDOR_DIRS = frozenset({"vendor", "vendors", "bower_components", "jspm_packages"})
+# Web static-asset roots, and the library directories that hold copied
+# libraries when they sit below one (``static/js/libs/``, ``public/lib/``).
+_STATIC_DIRS = frozenset({"static", "assets", "public", "wwwroot"})
+_STATIC_LIB_DIRS = frozenset({"lib", "libs", "plugins", "third_party", "thirdparty"})
+
+
+# How many example paths ``meta.vendored_skipped`` lists.
+VENDORED_EXAMPLES = 20
+
+
+def vendored_skip_message(count: int) -> str:
+    """One-line report of the files left out as vendored or minified JavaScript."""
+    noun = "file" if count == 1 else "files"
+    return f"{count} {noun} skipped as vendored (use --include-vendored)"
+
+
+# latin-1 maps every byte 0x00-0xff to one code point, so decoding never fails
+# and ASCII text is unchanged: https://docs.python.org/3/library/codecs.html#encodings-and-unicode
+FALLBACK_ENCODING = "latin-1"
+
+
+def decoded_with_fallback_message(entry: Dict[str, Any]) -> str:
+    """``<path>: decoded with fallback (latin-1)`` for reports."""
+    return f"{entry.get('path')}: decoded with fallback ({entry.get('encoding')})"
+
+
+def _not_analyzed_reason(entry: Dict[str, Any]) -> str:
+    """One-line reason for a ``meta.not_analyzed`` entry."""
+    what = "could not be read" if entry.get("reason") == "read_error" else "analyzer failed"
+    return f"{what} ({entry.get('exception')})"
+
+
+def not_analyzed_message(entry: Dict[str, Any]) -> str:
+    """``<path>: not analyzed, <reason>`` for reports."""
+    return f"{entry.get('path')}: not analyzed, {_not_analyzed_reason(entry)}"
+
+
+def is_vendored_js(rel_parts: Sequence[str]) -> bool:
+    """True for a JavaScript file that is minified or copied in from a library.
+
+    ``rel_parts`` are the components of the file path relative to the
+    analysis root, so directories above the root never count. Matched,
+    case-insensitively:
+
+    - a minified file name: ``*.min.js`` or ``*-min.js`` (also ``.mjs``/``.cjs``);
+    - a file inside a ``vendor``, ``vendors``, ``bower_components`` or
+      ``jspm_packages`` directory, at any depth;
+    - a file inside a ``lib``, ``libs``, ``plugins``, ``third_party`` or
+      ``thirdparty`` directory that is itself below a ``static``, ``assets``,
+      ``public`` or ``wwwroot`` directory (``static/js/libs/ace.js``).
+
+    A top-level ``lib/`` or ``plugins/`` (a package's own code) is not matched.
+    """
+    if not rel_parts:
+        return False
+    name = rel_parts[-1].lower()
+    stem = None
+    for suffix in _JS_SUFFIXES:
+        if name.endswith(suffix):
+            stem = name[: -len(suffix)]
+            break
+    if not stem:
+        return False
+    if stem.endswith(".min") or stem.endswith("-min"):
+        return True
+    dirs = [part.lower() for part in rel_parts[:-1]]
+    if any(part in _VENDOR_DIRS for part in dirs):
+        return True
+    seen_static = False
+    for part in dirs:
+        if seen_static and part in _STATIC_LIB_DIRS:
+            return True
+        if part in _STATIC_DIRS:
+            seen_static = True
+    return False
+
+
+def _relative_parts(path: Path, root: Path) -> Tuple[str, ...]:
+    try:
+        return path.relative_to(root).parts
+    except ValueError:
+        return path.parts
 
 
 class AnalyzerEngine:
@@ -84,6 +274,23 @@ class AnalyzerEngine:
         self._tsjs_parser: Any = None
         self._all_file_results: list = []  # EPIC 4: accumulated for _build_meta
         self._parser_failures: List[Dict[str, Any]] = []  # files skipped due to parser errors
+        # Found files that could not be read or whose analyzer raised
+        self._not_analyzed: List[Dict[str, Any]] = []
+        # Found files that are not valid UTF-8, read with FALLBACK_ENCODING
+        self._decoded_with_fallback: List[Dict[str, Any]] = []
+        # COBOL COPY index (COBOL007/COBOL015). Set for the whole run by
+        # prepare_cobol_index(); otherwise built per analyze_path() call.
+        self._cobol_index: Any = None
+        self._cobol_index_pinned = False
+        # Copybook directories outside the scan (copybook_paths / --copybook-path)
+        self._copybook_paths: List[Path] = []
+        self._copybook_library_names: Optional[Dict[str, str]] = None
+        # COBOL files whose source format was inferred as free (no directive)
+        self._cobol_inferred_free: List[str] = []
+        # Analyze vendored/minified JavaScript too (--include-vendored)
+        self._include_vendored = False
+        # Files left out as vendored/minified JavaScript, for the skip report
+        self._vendored_skipped: Set[str] = set()
 
         # Initialize enrichment orchestrator if config provided
         if enrich_config is not None:
@@ -99,6 +306,97 @@ class AnalyzerEngine:
             self._tsjs_parser = TsJsParser()
         if HAS_MULTILANG and SkipReport is not None:
             self._multilang_skip_report = SkipReport()
+
+    def set_include_vendored(self, include: bool) -> None:
+        """Also analyze vendored and minified JavaScript (see ``is_vendored_js``)."""
+        self._include_vendored = bool(include)
+
+    def set_copybook_paths(self, paths: List[str]) -> None:
+        """Extra copybook directories for COBOL015 (names there resolve COPY).
+
+        Their files are not analyzed; they only tell the index which copybook
+        names exist outside the scanned tree.
+        """
+        self._copybook_paths = [Path(p).resolve() for p in paths]
+        self._copybook_library_names = None  # walked again on next build
+
+    def prepare_cobol_index(self, paths: List[str], exclude_patterns: List[str]) -> None:
+        """Index COPY statements across every path of the run (COBOL007/COBOL015)."""
+        files: List[Path] = []
+        roots: List[Path] = []
+        for path in paths:
+            root = Path(path).resolve()
+            roots.append(root)
+            files.extend(self._find_files(root, exclude_patterns))
+        index = self._build_cobol_index(files, roots, exclude_patterns)
+        if index is not None:
+            self._cobol_index = index
+            self._cobol_index_pinned = True
+
+    def _build_cobol_index(
+        self, files: List[Path], roots: List[Path], exclude_patterns: List[str]
+    ) -> Any:
+        """COPY index for the COBOL files in ``files`` (None if there are none)."""
+        cobol = [f for f in files if self._is_cobol_path(f)]
+        if not cobol:
+            return None
+        from hefesto.analyzers.devops.cobol_project_index import (
+            CobolProjectIndex,
+            library_copybook_files,
+        )
+
+        extra: List[Path] = []
+        for root in roots:
+            extra.extend(self._extra_copybook_candidates(root, exclude_patterns))
+        if self._copybook_library_names is None:
+            # walked once per engine: analyze_path on several paths reuses it
+            self._copybook_library_names = (
+                library_copybook_files(self._copybook_paths) if self._copybook_paths else {}
+            )
+        return CobolProjectIndex.from_paths(
+            cobol, extra, library_names=self._copybook_library_names
+        )
+
+    @staticmethod
+    def _extra_copybook_candidates(root: Path, exclude_patterns: List[str]) -> List[Path]:
+        """Files under ``root`` that may be copybooks without a COBOL extension."""
+        from hefesto.analyzers.devops.cobol_project_index import is_extra_copybook_candidate
+
+        if not root.is_dir():
+            return []
+        excludes = list(DEFAULT_EXCLUDES) + list(exclude_patterns)
+        found: List[Path] = []
+        for dirpath, dirnames, filenames in os.walk(root):
+            rel_dir = _relative_parts(Path(dirpath), root)
+            dirnames[:] = [
+                d
+                for d in dirnames
+                if not d.startswith(".")
+                and not path_is_excluded(rel_dir + (d,), excludes, is_dir=True)
+            ]
+            for name in filenames:
+                candidate = Path(dirpath) / name
+                if is_extra_copybook_candidate(candidate) and not path_is_excluded(
+                    rel_dir + (name,), excludes
+                ):
+                    found.append(candidate)
+        return found
+
+    def _with_indexed_copybooks(self, source_files: List[Path], root: Path) -> List[Path]:
+        """Add copybooks the index found without a COBOL extension (under ``root``)."""
+        if self._cobol_index is None or not self._cobol_index.copybook_files:
+            return source_files
+        known = {str(f) for f in source_files}
+        extra = sorted(
+            Path(p)
+            for p in self._cobol_index.copybook_files
+            if p not in known and (Path(p) == root or root in Path(p).parents)
+        )
+        return source_files + extra
+
+    @staticmethod
+    def _is_cobol_path(path: Path) -> bool:
+        return path.suffix.lower() in (".cbl", ".cob", ".cobol", ".cpy", ".pco")
 
     def register_analyzer(self, analyzer):
         """Register an analyzer instance."""
@@ -159,11 +457,21 @@ class AnalyzerEngine:
         file_results = []
         all_issues = []
 
+        if not self._cobol_index_pinned:
+            self._cobol_index = self._build_cobol_index(
+                source_files, [path_obj], exclude_patterns or []
+            )
+        source_files = self._with_indexed_copybooks(source_files, path_obj)
+
+        not_analyzed_before = len(self._not_analyzed)
+        fallback_before = len(self._decoded_with_fallback)
         for py_file in source_files:
             file_result = self._analyze_file(py_file)
             if file_result:
                 file_results.append(file_result)
                 all_issues.extend(file_result.issues)
+        self._emit_not_analyzed(not_analyzed_before)
+        self._emit_decoded_with_fallback(fallback_before)
 
         # Project-level analyzers (Phase 1a — Operational Truth)
         if self._project_analyzers:
@@ -250,6 +558,8 @@ class AnalyzerEngine:
         file_results: List[FileAnalysisResult] = []
         all_issues: List[AnalysisIssue] = []
 
+        not_analyzed_before = len(self._not_analyzed)
+        fallback_before = len(self._decoded_with_fallback)
         for py_file in file_path_objs:
             if not py_file.exists() or not py_file.is_file():
                 continue
@@ -257,6 +567,8 @@ class AnalyzerEngine:
             if file_result:
                 file_results.append(file_result)
                 all_issues.extend(file_result.issues)
+        self._emit_not_analyzed(not_analyzed_before)
+        self._emit_decoded_with_fallback(fallback_before)
 
         # Project-level analyzers (Phase 1a/1b) run once against the project root.
         if self._project_analyzers:
@@ -281,9 +593,18 @@ class AnalyzerEngine:
         # Merge default excludes with user-provided patterns
         all_excludes = list(DEFAULT_EXCLUDES) + list(exclude_patterns)
 
+        include_vendored = self._include_vendored
+
         def excluded(p: Path) -> bool:
-            sp = str(p)
-            return any(pattern in sp for pattern in all_excludes)
+            rel = _relative_parts(p, path)
+            if path_is_excluded(rel, all_excludes):
+                return True
+            if not include_vendored and is_vendored_js(rel):
+                # counted only when no exclude pattern already drops the file
+                if p.is_file():
+                    self._vendored_skipped.add(str(p))
+                return True
+            return False
 
         # If a single file is provided, evaluate support with shebang-aware detection.
         if path.is_file():
@@ -318,16 +639,41 @@ class AnalyzerEngine:
         """Analyze a single file (multi-language support)."""
         start_time = time.time()
         file_path = file_path.resolve()
+        stage = "read"
+        language: Optional[Language] = None
 
         try:
-            with open(file_path, "r", encoding="utf-8") as f:
-                code = f.read()
+            code = self._read_source(file_path)
+            stage = "analyze"
+            with parse_scope():
+                return self._analyze_source(file_path, code, start_time)
+        except Exception as exc:
+            # Never drop a found file silently: it is reported as not analyzed
+            # (text, JSON and SARIF) and fails --fail-on unless opted out.
+            self._not_analyzed.append(
+                {
+                    "path": str(file_path),
+                    "language": language.value if language is not None else None,
+                    "reason": "read_error" if stage == "read" else "analyzer_error",
+                    "exception": type(exc).__name__,
+                }
+            )
+            logger.debug("Not analyzed: %s (%s)", file_path, exc, exc_info=True)
+            return None
 
+    def _analyze_source(
+        self, file_path: Path, code: str, start_time: float
+    ) -> Optional[FileAnalysisResult]:
+        """Detect the language and run its analyzers. One YAML/JSON parse is shared."""
+        language: Optional[Language] = None
+        try:
             # Cache source for ML semantic analysis (Phase 1)
             self.source_cache[str(file_path)] = code
 
-            # Detect language
+            # Detect language (copybooks without a COBOL extension come from the index)
             language = LanguageDetector.detect(file_path, code)
+            if self._cobol_index is not None and str(file_path) in self._cobol_index.copybook_files:
+                language = Language.COBOL
             if language == Language.UNKNOWN:
                 return None
 
@@ -412,16 +758,26 @@ class AnalyzerEngine:
                     CobolGovernanceAnalyzer,
                 )
 
-                cobol_issues = CobolGovernanceAnalyzer().analyze(str(file_path), code)
+                cobol_analyzer = CobolGovernanceAnalyzer(index=self._cobol_index)
+                cobol_issues = cobol_analyzer.analyze(str(file_path), code)
                 filtered_issues = self._filter_by_severity(cobol_issues)
                 duration_ms = (time.time() - start_time) * 1000
+                cobol_meta: Dict[str, Any] = {}
+                if cobol_analyzer.last_format_reason == "inferred-free":
+                    self._cobol_inferred_free.append(str(file_path))
+                    cobol_meta["cobol_source_format"] = "inferred-free"
                 return FileAnalysisResult(
                     file_path=str(file_path),
                     issues=filtered_issues,
                     lines_of_code=loc,
                     analysis_duration_ms=duration_ms,
                     language=language.value,
+                    metadata=cobol_meta,
                 )
+
+            dispatched = self._analyze_dispatched(language, file_path, code, loc, start_time)
+            if dispatched is not None:
+                return dispatched
 
             try:
                 parser = ParserFactory.get_parser(language)
@@ -465,9 +821,31 @@ class AnalyzerEngine:
                 result.metadata = file_meta
             return result
 
-        except Exception:
-            # Skip files that can't be read or analyzed
+        except Exception as exc:
+            # Never drop a found file silently: it is reported as not analyzed
+            # (text, JSON and SARIF) and fails --fail-on unless opted out.
+            self._not_analyzed.append(
+                {
+                    "path": str(file_path),
+                    "language": language.value if language is not None else None,
+                    "reason": "analyzer_error",
+                    "exception": type(exc).__name__,
+                }
+            )
+            logger.debug("Not analyzed: %s (%s)", file_path, exc, exc_info=True)
             return None
+
+    def _read_source(self, file_path: Path) -> str:
+        """UTF-8, else FALLBACK_ENCODING (never fails to decode); the file is listed."""
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                return f.read()
+        except UnicodeDecodeError:
+            pass
+        with open(file_path, "r", encoding=FALLBACK_ENCODING) as f:
+            code = f.read()
+        self._decoded_with_fallback.append({"path": str(file_path), "encoding": FALLBACK_ENCODING})
+        return code
 
     def _run_project_analyzers(self, project_root: Path) -> List[AnalysisIssue]:
         """Run registered project-level analyzers once against the project root.
@@ -513,6 +891,44 @@ class AnalyzerEngine:
                 synthetic[issue.file_path] = target
                 file_results.append(target)
             target.issues.append(issue)
+
+    def _analyze_dispatched(
+        self,
+        language: Language,
+        file_path: Path,
+        code: str,
+        loc: int,
+        start_time: float,
+    ) -> Optional[FileAnalysisResult]:
+        """Run a text or cloud analyzer. ``None`` means this language is not one of them.
+
+        A supported file with zero findings still returns a result, so a clean
+        ``tsconfig.json`` counts as analyzed.
+        """
+        import importlib
+
+        text = _TEXT_ANALYZERS.get(language)
+        cloud = _CLOUD_ANALYZERS.get(language)
+        if text is not None:
+            module_name, class_name = text
+            analyzer = getattr(importlib.import_module(module_name), class_name)()
+            issues = analyzer.analyze(str(file_path), code)
+        elif cloud is not None:
+            module_name, class_name = cloud
+            analyzer = getattr(importlib.import_module(module_name), class_name)()
+            from hefesto.analyzers.cloud.adapt import cloud_findings_to_issues
+
+            issues = cloud_findings_to_issues(analyzer.analyze(code, str(file_path)))
+        else:
+            return None
+        duration_ms = (time.time() - start_time) * 1000
+        return FileAnalysisResult(
+            file_path=str(file_path),
+            issues=self._filter_by_severity(issues),
+            lines_of_code=loc,
+            analysis_duration_ms=duration_ms,
+            language=language.value,
+        )
 
     def _filter_by_severity(self, issues: List[AnalysisIssue]) -> List[AnalysisIssue]:
         """Filter issues by severity threshold."""
@@ -562,6 +978,44 @@ class AnalyzerEngine:
             return "parser_unavailable"
         logger.debug("Uncategorized parser failure (defaulting to parse_error)", exc_info=True)
         return "parse_error"
+
+    def _emit_not_analyzed(self, start: int) -> None:
+        """Warn on stderr about files of this call that could not be analyzed.
+
+        Printed even with ``--quiet`` (like the no-files warning): a file the
+        gate did not check must never look like a clean pass.
+        """
+        entries = self._not_analyzed[start:]
+        if not entries:
+            return
+        import click
+
+        click.echo(
+            f"Warning: {len(entries)} file(s) could not be analyzed (see 'Not analyzed' in the"
+            " report; meta.not_analyzed in JSON):",
+            err=True,
+        )
+        for entry in entries[:10]:
+            click.echo(f"   - {entry['path']}: {_not_analyzed_reason(entry)}", err=True)
+        if len(entries) > 10:
+            click.echo(f"   ... and {len(entries) - 10} more", err=True)
+
+    def _emit_decoded_with_fallback(self, start: int) -> None:
+        """Warn on stderr (also with ``--quiet``) about files read with the fallback."""
+        entries = self._decoded_with_fallback[start:]
+        if not entries:
+            return
+        import click
+
+        click.echo(
+            f"Warning: {len(entries)} file(s) are not valid UTF-8 and were decoded with fallback"
+            f" ({FALLBACK_ENCODING}); they were analyzed:",
+            err=True,
+        )
+        for entry in entries[:10]:
+            click.echo(f"   - {entry['path']}", err=True)
+        if len(entries) > 10:
+            click.echo(f"   ... and {len(entries) - 10} more", err=True)
 
     def _emit_skip_summary(self) -> None:
         """Emit categorized parser-skip warnings to stderr.
@@ -694,6 +1148,15 @@ class AnalyzerEngine:
                 result = orch.run(inp, config)
                 issue.metadata["enrichment"] = result.to_dict()
 
+    def _file_records(self) -> Dict[str, Any]:
+        """Per-file records for ``meta``; empty lists are left out."""
+        records = {
+            "parser_failures": self._parser_failures,
+            "not_analyzed": self._not_analyzed,
+            "decoded_with_fallback": self._decoded_with_fallback,
+        }
+        return {key: list(entries) for key, entries in records.items() if entries}
+
     def _build_meta(self) -> dict:
         """Assemble the ``meta`` dict for the report from PRO features."""
         meta: dict = {}
@@ -728,11 +1191,32 @@ class AnalyzerEngine:
                 "by_rule": by_rule,
             }
 
-        # Parser failures (silent skips of tree-sitter-dependent languages)
-        if self._parser_failures:
-            meta["parser_failures"] = list(self._parser_failures)
+        # Parser failures (silent skips of tree-sitter-dependent languages),
+        # files not analyzed, files decoded with the fallback encoding
+        meta.update(self._file_records())
+
+        # Vendored/minified JavaScript left out of the run (--include-vendored)
+        if self._vendored_skipped:
+            meta["vendored_skipped"] = {
+                "count": len(self._vendored_skipped),
+                "examples": sorted(self._vendored_skipped)[:VENDORED_EXAMPLES],
+            }
+
+        # COBOL sources read as free format because of the layout, not a directive
+        if self._cobol_inferred_free:
+            meta["cobol_format_notices"] = {
+                "inferred_free": list(dict.fromkeys(self._cobol_inferred_free)),
+                "message": COBOL_INFERRED_FREE_NOTICE,
+            }
 
         return meta
 
 
-__all__ = ["AnalyzerEngine", "DEFAULT_EXCLUDES"]
+__all__ = [
+    "AnalyzerEngine",
+    "COBOL_INFERRED_FREE_NOTICE",
+    "DEFAULT_EXCLUDES",
+    "is_vendored_js",
+    "vendored_skip_message",
+    "path_is_excluded",
+]

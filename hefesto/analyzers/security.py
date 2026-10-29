@@ -14,14 +14,88 @@ Copyright © 2025 Narapa LLC, Miami, Florida
 """
 
 import re
+from pathlib import Path, PurePosixPath
 from typing import List, Tuple
 
+from hefesto.analyzers.eval_calls import find_eval_calls
 from hefesto.core.analysis_models import (
     AnalysisIssue,
     AnalysisIssueSeverity,
     AnalysisIssueType,
 )
 from hefesto.core.ast.generic_ast import GenericAST
+from hefesto.core.safe_parse import parse_or_none
+
+# Directory names that mark test or example code. Matched against whole path
+# segments (case-insensitive), never as substrings: ``tests/`` counts, but
+# ``contest/``, ``latest_app/`` or ``/tmp/pytest-of-user/`` do not (SEC-03).
+_TEST_DIRS = frozenset({"test", "tests", "__tests__"})
+_EXAMPLE_DIRS = frozenset({"example", "examples"})
+
+
+def _path_segments(file_path: str) -> List[str]:
+    """Split *file_path* into lower-cased segments, relative to the cwd if inside it.
+
+    The engine passes resolved absolute paths. Making them relative to the
+    directory Hefesto runs from (the project root for the CLI and the GitHub
+    Action) keeps parent directories outside the project, such as
+    ``/home/me/tests/myrepo/``, from classifying every file as test code.
+    """
+    normalized = file_path.replace("\\", "/")
+    path = Path(normalized)
+    if path.is_absolute():
+        try:
+            normalized = path.relative_to(Path.cwd().resolve()).as_posix()
+        except (ValueError, OSError):
+            pass
+    return [seg for seg in PurePosixPath(normalized.lower()).parts if seg not in ("", "/")]
+
+
+def is_test_path(file_path: str) -> bool:
+    """Return True if *file_path* is test code.
+
+    True when a directory segment is exactly ``test``, ``tests`` or
+    ``__tests__``, or the file name follows a test convention: ``test_*``,
+    ``*_test.<ext>``, ``*.test.<ext>``, ``*.spec.<ext>``, ``conftest.py``,
+    ``test.py`` or ``tests.py``. Substrings never count, so
+    ``src/contest/config.py`` and ``latest_settings.py`` are not test code.
+    There is no special case for ``fixtures``: a fixture under ``tests/`` is
+    test code because of the ``tests`` segment.
+    """
+    parts = _path_segments(file_path)
+    if not parts:
+        return False
+    *dirs, name = parts
+    if any(seg in _TEST_DIRS for seg in dirs):
+        return True
+    stem = name.split(".", 1)[0]
+    return (
+        name.startswith("test_")
+        or stem.endswith("_test")
+        or stem in ("test", "tests", "conftest")
+        or ".test." in name
+        or ".spec." in name
+    )
+
+
+def is_example_path(file_path: str) -> bool:
+    """Return True if *file_path* is example code or an example template.
+
+    True when a directory segment is exactly ``example`` or ``examples``, or
+    the file name ends in ``.example`` (e.g. ``.env.example``). Substrings never
+    count (``counterexample.py`` is scanned).
+    """
+    parts = _path_segments(file_path)
+    if not parts:
+        return False
+    *dirs, name = parts
+    return any(seg in _EXAMPLE_DIRS for seg in dirs) or name.endswith(".example")
+
+
+def is_test_or_example_path(file_path: str) -> bool:
+    """Return True if *file_path* is test code or example code (see above)."""
+    return is_test_path(file_path) or is_example_path(file_path)
+
 
 # Sinks that indicate SQL strings are actually executed (not just built/logged).
 _SQL_EXECUTE_SINKS = re.compile(
@@ -93,6 +167,55 @@ def _has_dynamic_concatenation(line: str) -> bool:
     return False
 
 
+# Key prefixes that vendors document as safe to ship in client code:
+# PostHog project tokens (https://posthog.com/docs/api) and Stripe publishable
+# keys (https://docs.stripe.com/keys). Secret keys from the same vendors
+# (``phx_``, ``phs_``, ``sk_``, ``rk_``) are not listed and stay CRITICAL.
+_PUBLIC_CLIENT_KEY = re.compile(r"(?:phc_|pk_live_|pk_test_)[A-Za-z0-9]+")
+
+# Only generic name-based matches are downgraded. A public-looking value
+# assigned to ``secret_key`` or ``password`` is reported as CRITICAL.
+_DOWNGRADABLE_SECRET_TYPES = frozenset({"API key", "Token"})
+
+
+def _is_public_client_key(match: "re.Match[str]", secret_type: str) -> bool:
+    """Return True if *match* captured a known public client key as the whole value."""
+    if secret_type not in _DOWNGRADABLE_SECRET_TYPES or match.lastindex is None:
+        return False
+    return _PUBLIC_CLIENT_KEY.fullmatch(match.group(1)) is not None
+
+
+def _secret_issue(
+    file_path: str, line_num: int, line: str, match: "re.Match[str]", secret_type: str
+) -> AnalysisIssue:
+    column = line.find(match.group(0))
+    if _is_public_client_key(match, secret_type):
+        return AnalysisIssue(
+            file_path=file_path,
+            line=line_num,
+            column=column,
+            issue_type=AnalysisIssueType.HARDCODED_SECRET,
+            severity=AnalysisIssueSeverity.LOW,
+            message=f"Hardcoded {secret_type} is a known public client key "
+            "(PostHog project token or Stripe publishable key)",
+            suggestion="Public client keys are designed to be exposed. Confirm the "
+            "value is the public key and not a secret key from the same vendor.",
+            metadata={"secret_type": secret_type, "public_client_key": True},
+        )
+    return AnalysisIssue(
+        file_path=file_path,
+        line=line_num,
+        column=column,
+        issue_type=AnalysisIssueType.HARDCODED_SECRET,
+        severity=AnalysisIssueSeverity.CRITICAL,
+        message=f"Hardcoded {secret_type} detected",
+        suggestion="Move to environment variable or secrets manager:\n"
+        f"Use: os.getenv('{secret_type.upper().replace(' ', '_')}')\n"
+        "Or use a secrets management service like AWS Secrets Manager",
+        metadata={"secret_type": secret_type},
+    )
+
+
 class SecurityAnalyzer:
     """Analyzes code for security vulnerabilities."""
 
@@ -128,33 +251,18 @@ class SecurityAnalyzer:
         self, tree: GenericAST, file_path: str, code: str
     ) -> List[AnalysisIssue]:
         """Detect hardcoded secrets in code."""
-        issues = []
+        issues: List[AnalysisIssue] = []
+
+        # Skip test/example code to reduce noise. Matching is by path segment
+        # and file-name convention, never by substring (SEC-03).
+        if is_test_or_example_path(file_path):
+            return issues
 
         for line_num, line in enumerate(code.split("\n"), start=1):
             for pattern, secret_type in self.SECRET_PATTERNS:
                 match = re.search(pattern, line, re.IGNORECASE)
                 if match:
-                    # Skip test/example files to reduce noise, but allow
-                    # action fixtures that are specifically designed to test detection.
-                    path_lower = file_path.lower().replace("\\", "/")
-                    is_action_fixture = "tests/fixtures/action/" in path_lower
-                    if not is_action_fixture and ("test" in path_lower or "example" in path_lower):
-                        continue
-
-                    issues.append(
-                        AnalysisIssue(
-                            file_path=file_path,
-                            line=line_num,
-                            column=line.find(match.group(0)),
-                            issue_type=AnalysisIssueType.HARDCODED_SECRET,
-                            severity=AnalysisIssueSeverity.CRITICAL,
-                            message=f"Hardcoded {secret_type} detected",
-                            suggestion="Move to environment variable or secrets manager:\n"
-                            f"Use: os.getenv('{secret_type.upper().replace(' ', '_')}')\n"
-                            "Or use a secrets management service like AWS Secrets Manager",
-                            metadata={"secret_type": secret_type},
-                        )
-                    )
+                    issues.append(_secret_issue(file_path, line_num, line, match, secret_type))
 
         return issues
 
@@ -249,9 +357,8 @@ class SecurityAnalyzer:
         import ast as python_ast
 
         issues: List[AnalysisIssue] = []
-        try:
-            py_tree = python_ast.parse(code)
-        except SyntaxError:
+        py_tree = parse_or_none(code, file_path)
+        if py_tree is None:
             return issues
 
         sql_kw_re = re.compile(
@@ -399,9 +506,10 @@ class SecurityAnalyzer:
     def _check_eval_usage(self, tree: GenericAST, file_path: str, code: str) -> List[AnalysisIssue]:
         """Detect dangerous eval() usage.
 
-        For Python files: Uses AST to detect actual eval/exec calls, avoiding
-        false positives from regex patterns, docstrings, or comments.
-        For other languages: Falls back to regex-based detection.
+        Python uses the ``ast`` module; JavaScript, TypeScript and Java use the
+        tree-sitter syntax tree (``hefesto.analyzers.eval_calls``). Comments,
+        strings, ``RegExp.prototype.exec`` and a project's own ``exec`` methods
+        are never reported.
         """
         issues: List[AnalysisIssue] = []
 
@@ -409,8 +517,9 @@ class SecurityAnalyzer:
         if tree.language == "python":
             import ast as python_ast
 
-            try:
-                py_tree = python_ast.parse(code)
+            # A file with a syntax error has no AST-based eval findings.
+            py_tree = parse_or_none(code, file_path)
+            if py_tree is not None:
                 for node in python_ast.walk(py_tree):
                     if isinstance(node, python_ast.Call):
                         func = node.func
@@ -430,34 +539,23 @@ class SecurityAnalyzer:
                                     metadata={"function": func.id},
                                 )
                             )
-            except SyntaxError:
-                # If AST parsing fails, fall back to regex
-                pass
         else:
-            # For non-Python languages: use regex-based detection
-            patterns = [
-                (r"\beval\s*\(", "eval"),
-                (r"\bexec\s*\(", "exec"),
-            ]
-
-            for line_num, line in enumerate(code.split("\n"), start=1):
-                for pattern, func_name in patterns:
-                    if re.search(pattern, line):
-                        issues.append(
-                            AnalysisIssue(
-                                file_path=file_path,
-                                line=line_num,
-                                column=0,
-                                issue_type=AnalysisIssueType.EVAL_USAGE,
-                                severity=AnalysisIssueSeverity.CRITICAL,
-                                message=f"Dangerous {func_name}() usage detected",
-                                suggestion="Avoid eval/exec. Use safe alternatives:\n"
-                                "- ast.literal_eval() for literals\n"
-                                "- json.loads() for JSON\n"
-                                "- Implement proper parsing logic",
-                                metadata={"function": func_name},
-                            )
-                        )
+            for line_num, func_name in find_eval_calls(tree, code):
+                issues.append(
+                    AnalysisIssue(
+                        file_path=file_path,
+                        line=line_num,
+                        column=0,
+                        issue_type=AnalysisIssueType.EVAL_USAGE,
+                        severity=AnalysisIssueSeverity.CRITICAL,
+                        message=f"Dangerous {func_name}() usage detected",
+                        suggestion="Avoid eval/exec. Use safe alternatives:\n"
+                        "- JSON.parse() / a real parser for data\n"
+                        "- execFile/spawn (or ProcessBuilder) with an argument list, no shell\n"
+                        "- an allow-list of operations instead of evaluating input",
+                        metadata={"function": func_name},
+                    )
+                )
 
         return issues
 
@@ -480,9 +578,8 @@ class SecurityAnalyzer:
 
         import ast as python_ast
 
-        try:
-            py_tree = python_ast.parse(code)
-        except SyntaxError:
+        py_tree = parse_or_none(code, file_path)
+        if py_tree is None:
             return issues
 
         def _report(line: int, col: int) -> None:
@@ -534,7 +631,7 @@ class SecurityAnalyzer:
         """
         issues: List[AnalysisIssue] = []
 
-        if "test" in file_path.lower():
+        if is_test_path(file_path):
             return issues
 
         if tree.language != "python" or not code:
@@ -542,9 +639,8 @@ class SecurityAnalyzer:
 
         import ast as python_ast
 
-        try:
-            py_tree = python_ast.parse(code)
-        except SyntaxError:
+        py_tree = parse_or_none(code, file_path)
+        if py_tree is None:
             return issues
 
         for node in python_ast.walk(py_tree):
@@ -586,9 +682,8 @@ class SecurityAnalyzer:
 
         import ast as python_ast
 
-        try:
-            py_tree = python_ast.parse(code)
-        except SyntaxError:
+        py_tree = parse_or_none(code, file_path)
+        if py_tree is None:
             return issues
 
         for node in python_ast.walk(py_tree):

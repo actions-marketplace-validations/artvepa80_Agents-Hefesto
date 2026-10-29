@@ -454,20 +454,22 @@ class TestEngineMultiPathAccumulation:
             from hefesto.core.analyzer_engine import AnalyzerEngine
             from hefesto.pro_optional import ScopeGatingConfig
 
-            # Create two directories, each with a vendor file
+            # Create two directories, each with a vendor file. Python, not
+            # JavaScript: vendored JS never reaches scope gating because file
+            # discovery already skips it (see is_vendored_js).
             d1 = tmp_path / "pkg1"
             d1.mkdir()
             (d1 / "app.py").write_text("x = 1\n")
             v1 = d1 / "vendor"
             v1.mkdir()
-            (v1 / "dep.js").write_text("var x = 1;\n")
+            (v1 / "dep.py").write_text("x = 1\n")
 
             d2 = tmp_path / "pkg2"
             d2.mkdir()
             (d2 / "lib.py").write_text("y = 2\n")
             v2 = d2 / "vendor"
             v2.mkdir()
-            (v2 / "dep2.js").write_text("var y = 2;\n")
+            (v2 / "dep2.py").write_text("y = 2\n")
 
             engine = AnalyzerEngine(
                 severity_threshold="LOW",
@@ -503,7 +505,9 @@ class TestApiHardeningWiring:
         runner = CliRunner()
         result = runner.invoke(cli, ["serve"])
         assert result.exit_code != 0
-        assert "PRO/OMEGA" in result.output or "PRO/OMEGA" in (result.stderr or "")
+        output = result.output + (result.stderr or "")
+        assert "Hefesto PRO" in output and "OMEGA" in output
+        assert "https://hefestoai.narapallc.com/#pricing" in output
 
     def test_apply_hardening_fallback_is_noop(self):
         """apply_hardening fallback should be a no-op that doesn't crash."""

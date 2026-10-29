@@ -50,7 +50,6 @@ Hefesto uses a **3-phase analysis pipeline** to ensure high-quality, accurate co
 │  • Semantic Code Analysis                               │
 │  • Duplicate Detection (similar code patterns)          │
 │  • Confidence Boosting (learn from codebase)           │
-│  • BigQuery Analytics Integration                       │
 │                                                         │
 │  Output: Enhanced analysis with ML insights             │
 └─────────────────────────────────────────────────────────┘
@@ -116,16 +115,14 @@ class SuggestionValidator:
 #### 1. AST-Based Verification
 
 ```python
-import ast
+from hefesto.core.safe_parse import safe_parse
 
 def validate_syntax(code: str) -> bool:
     """Verify code is syntactically valid."""
-    try:
-        ast.parse(code)
-        return True
-    except SyntaxError:
-        return False
+    return safe_parse(code, "<suggested-fix>").tree is not None
 ```
+
+`safe_parse` returns the same tree as `ast.parse`, records compiler warnings (such as an invalid escape sequence) instead of printing them, and gives the same answer under `PYTHONWARNINGS=error`, where a bare `ast.parse` raises `SyntaxError` for code that only has a warning.
 
 **Use Cases:**
 - Verify suggested fixes are valid Python
@@ -221,12 +218,13 @@ def analyze_context(file_path: str, line_number: int) -> dict:
         end = min(len(lines), line_number + 3)
         context["surrounding_lines"] = "".join(lines[start:end])
 
-    # Check for special markers
-    if "# hefesto: ignore" in context["surrounding_lines"]:
-        context["suppressed"] = True
-
     return context
 ```
+
+Hefesto has no inline suppression marker (`# hefesto: ignore` is not
+read). To keep paths or issue types out of the results or the gate, use
+`--exclude`, `--exclude-types`, or `exclude` / `exclude_types` in
+`.hefesto.yaml`; see [Analysis Rules](ANALYSIS_RULES.md#excluding-paths-and-issue-types).
 
 **Context Factors:**
 - File location (test vs production)
@@ -499,7 +497,9 @@ def learn_patterns(
 - Documentation styles
 - Test patterns
 
-#### 5. BigQuery Analytics Integration
+#### 5. BigQuery Analytics Integration (historical design, not shipped)
+
+> This section is an early design sketch. PRO does not ship BigQuery analytics. IRIS telemetry storage is provider-agnostic: you choose where the data lives. Today's adapters are in-memory, file (JSONL) and BigQuery (optional); more are planned.
 
 ```python
 def upload_analysis_results(
@@ -692,7 +692,7 @@ class AnalyzerEngine:
             click.echo("      • BigQuery analytics")
             click.echo("      • Confidence boosting")
             click.echo("")
-            click.echo("   Try 14-day free trial: https://buy.stripe.com/hefesto-pro-trial")
+            click.echo("   PRO $8/mo. OMEGA $19/mo: https://hefestoai.narapallc.com/#pricing")
 ```
 
 ### Graceful Degradation
@@ -903,7 +903,7 @@ print(f"Explanation: {result.explanation}")
 **Rationale:**
 - **Reliability:** Static analysis is deterministic and fast
 - **Cost:** Running ML on every analysis is expensive
-- **Offline:** Static analysis works without internet
+- **Offline:** Static analysis needs no internet (the CLI still sends opt-out telemetry and a pypi.org version check)
 - **Explainability:** Static rules are easier to understand
 
 **Trade-offs:**
@@ -933,7 +933,7 @@ print(f"Explanation: {result.explanation}")
 - **Size:** 80MB model, runs on CPU
 - **Speed:** ~50ms per embedding
 - **Quality:** Good semantic understanding
-- **Offline:** No API calls needed
+- **Offline:** No API calls needed for the embedding model (the CLI still sends opt-out telemetry and a pypi.org version check)
 
 **Trade-offs:**
 - Not specialized for code (generic sentence model)

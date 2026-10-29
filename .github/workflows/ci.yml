@@ -20,14 +20,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.10", "3.11", "3.12", "3.13"]
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
@@ -39,6 +39,18 @@ jobs:
 
       - name: Guard (public repo boundary)
         run: python scripts/guard_public_repo.py
+
+      - name: Commit metadata (PR range)
+        # Commit authors and Co-authored-by trailers in the PR must not name
+        # internal agents. Fetch the base branch's commit history only (no
+        # trees or blobs) so the shallow checkout can compute the range.
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          git fetch --no-tags --unshallow --filter=tree:0 origin "+refs/heads/${BASE_REF}:refs/remotes/origin/${BASE_REF}"
+          python scripts/guard_public_repo.py --check-commits "origin/${BASE_REF}..${HEAD_SHA}"
 
       - name: Mypy (blocking)
         run: python -m mypy hefesto --ignore-missing-imports
@@ -70,6 +82,9 @@ jobs:
       - name: Verify README Parity
         run: python scripts/verify_readme.py
 
+      - name: Verify MCP server.json
+        run: python scripts/verify_server_json.py
+
       - name: Pytest (unit)
         env:
           CI: true
@@ -81,7 +96,7 @@ jobs:
             --cov=hefesto --cov-report=xml --cov-report=term
 
       - name: Upload coverage
-        uses: codecov/codecov-action@v4
+        uses: codecov/codecov-action@v5
         with:
           files: ./coverage.xml
           flags: unittests
@@ -92,10 +107,10 @@ jobs:
     runs-on: ubuntu-latest
     needs: lint-and-test
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.11"
 

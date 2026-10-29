@@ -13,14 +13,14 @@ jobs:
   smoke-test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       
       # Test Case A: Clean Scan (Expect Exit Code 0)
       - name: Test Action (Clean)
         id: clean_scan
         uses: ./
         with:
-          target: 'tests/fixtures/action/clean.py'
+          target: '.github/action-smoke/clean.py'
           fail_on: 'CRITICAL'
           min_severity: 'LOW'
           format: 'text'
@@ -40,7 +40,7 @@ jobs:
         id: critical_scan
         uses: ./
         with:
-          target: 'tests/fixtures/action/critical_secret.py'
+          target: '.github/action-smoke/critical_secret.py'
           fail_on: 'CRITICAL'
           min_severity: 'CRITICAL'
           format: 'json'
@@ -59,3 +59,21 @@ jobs:
           fi
           echo "OK: exit code 1 (gate failure) as expected"
 
+      # Test Case C: SARIF file written (no upload, so no security-events permission needed)
+      - name: Test Action (SARIF)
+        id: sarif_scan
+        uses: ./
+        with:
+          target: '.github/action-smoke/critical_secret.py'
+          fail_on: 'CRITICAL'
+          min_severity: 'LOW'
+          sarif: 'true'
+          sarif_file: 'smoke.sarif'
+          upload_sarif: 'false'
+        continue-on-error: true
+
+      - name: Verify SARIF Output
+        if: always()
+        run: |
+          test "${{ steps.sarif_scan.outputs.sarif_file }}" = "smoke.sarif"
+          python3 -c 'import json; log = json.load(open("smoke.sarif")); assert log["version"] == "2.1.0"; r = log["runs"][0]["results"]; assert any(x["level"] == "error" for x in r), r; print("OK:", len(r), "SARIF results")'

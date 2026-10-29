@@ -32,6 +32,7 @@ from hefesto.core.analysis_models import (
     AnalysisIssueSeverity,
     AnalysisIssueType,
 )
+from hefesto.core.safe_parse import safe_parse
 
 logger = logging.getLogger(__name__)
 
@@ -227,8 +228,12 @@ class ImportsVsDepsAnalyzer:
         imports: Set[str] = set()
         for py in self._iter_python_files(project_root):
             try:
-                tree = ast.parse(py.read_text(encoding="utf-8", errors="ignore"))
+                source = py.read_text(encoding="utf-8", errors="ignore")
             except Exception:
+                continue
+            # Files that cannot be parsed for any reason are skipped.
+            tree = safe_parse(source, str(py)).tree
+            if tree is None:
                 continue
             for node in self._iter_effective_imports(tree):
                 if isinstance(node, ast.Import):
@@ -361,6 +366,8 @@ class ImportsVsDepsAnalyzer:
 
     def _iter_python_files(self, project_root: Path) -> Iterable[Path]:
         for path in project_root.rglob("*.py"):
-            if any(part in EXCLUDED_DIRS for part in path.parts):
+            # Only components below the project root: a checkout under
+            # ``~/build/`` or ``~/docs/`` must still be scanned.
+            if any(part in EXCLUDED_DIRS for part in path.relative_to(project_root).parts):
                 continue
             yield path

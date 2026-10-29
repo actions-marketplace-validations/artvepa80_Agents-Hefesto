@@ -6,7 +6,7 @@ Generates formatted text output for the terminal with colors and structure.
 Copyright © 2025 Narapa LLC, Miami, Florida
 """
 
-from typing import List
+from typing import Any, Dict, List, Optional
 
 from hefesto.core.analysis_models import (
     AnalysisIssue,
@@ -53,7 +53,7 @@ class TextReporter:
         lines.append("")
 
         # Summary
-        lines.append(self._format_summary(report.summary))
+        lines.append(self._format_summary(report.summary, report.meta))
         lines.append("")
 
         # Issues by severity
@@ -75,11 +75,42 @@ class TextReporter:
             low = [i for i in all_issues if i.severity == AnalysisIssueSeverity.LOW]
             lines.append(self._format_severity_section(AnalysisIssueSeverity.LOW, low))
 
+        lines.extend(self._notes_block(report))
+
         # Footer
         lines.append("")
         lines.append(self._format_footer(report))
 
         return "\n".join(lines)
+
+    @staticmethod
+    def _not_analyzed_lines(meta: Optional[Dict[str, Any]]) -> List[str]:
+        """Found files that could not be analyzed (``meta.not_analyzed``)."""
+        entries = (meta or {}).get("not_analyzed") or []
+        if not entries:
+            return []
+        from hefesto.core.analyzer_engine import not_analyzed_message
+
+        lines = [f"   Not analyzed: {len(entries)}"]
+        lines.extend(f"   - {not_analyzed_message(entry)}" for entry in entries[:10])
+        if len(entries) > 10:
+            lines.append(f"   ... and {len(entries) - 10} more (see meta.not_analyzed in JSON)")
+        return lines
+
+    @staticmethod
+    def _fallback_lines(meta: Optional[Dict[str, Any]]) -> List[str]:
+        """Files that are not valid UTF-8 and were analyzed after a fallback decode."""
+        entries = (meta or {}).get("decoded_with_fallback") or []
+        if not entries:
+            return []
+        encoding = entries[0].get("encoding")
+        lines = [f"   Decoded with fallback ({encoding}): {len(entries)}"]
+        lines.extend(f"   - {entry.get('path')}" for entry in entries[:10])
+        if len(entries) > 10:
+            lines.append(
+                f"   ... and {len(entries) - 10} more (see meta.decoded_with_fallback in JSON)"
+            )
+        return lines
 
     def _format_header(self) -> str:
         """Format report header."""
@@ -87,12 +118,19 @@ class TextReporter:
         reset = self.COLORS["RESET"]
         return f"{bold}🔨 HEFESTO CODE ANALYSIS{reset}\n" "========================"
 
-    def _format_summary(self, summary) -> str:
+    def _format_summary(self, summary, meta: Optional[Dict[str, Any]] = None) -> str:
         """Format summary section."""
         bold = self.COLORS["BOLD"]
         reset = self.COLORS["RESET"]
         lines = [f"{bold}📊 Summary:{reset}"]
         lines.append(f"   Files analyzed: {summary.files_analyzed}")
+        vendored = (meta or {}).get("vendored_skipped") or {}
+        if vendored.get("count"):
+            from hefesto.core.analyzer_engine import vendored_skip_message
+
+            lines.append(f"   {vendored_skip_message(vendored['count'])}")
+        lines.extend(self._not_analyzed_lines(meta))
+        lines.extend(self._fallback_lines(meta))
         lines.append(f"   Issues found: {summary.total_issues}")
 
         if summary.total_issues > 0:
@@ -140,8 +178,9 @@ class TextReporter:
             location += f":{issue.column}"
         lines.append(f"  📄 {location}")
 
-        # Issue details
-        lines.append(f"  ├─ Issue: {issue.message}")
+        # Issue details (rule id inline when the analyzer set one, e.g. [J001])
+        rule = f"[{issue.rule_id}] " if issue.rule_id else ""
+        lines.append(f"  ├─ Issue: {rule}{issue.message}")
 
         if issue.function_name:
             lines.append(f"  ├─ Function: {issue.function_name}")
@@ -158,13 +197,39 @@ class TextReporter:
 
         return "\n".join(lines)
 
+    def _notes_block(self, report: AnalysisReport) -> List[str]:
+        notes = self._format_notes(report)
+        return ["", notes] if notes else []
+
+    def _format_notes(self, report: AnalysisReport) -> str:
+        """Notes that are not findings (e.g. COBOL source format inferred as free)."""
+        cobol = (report.meta or {}).get("cobol_format_notices") or {}
+        files = cobol.get("inferred_free") or []
+        if not files:
+            return ""
+        bold = self.COLORS["BOLD"]
+        reset = self.COLORS["RESET"]
+        lines = [f"{bold}ℹ️  Notes:{reset}"]
+        lines.append(
+            f"   {len(files)} COBOL file(s) read as free format: {cobol.get('message', '')}"
+        )
+        for path in files[:10]:
+            lines.append(f"   - {path}")
+        if len(files) > 10:
+            lines.append(
+                f"   ... and {len(files) - 10} more (see meta.cobol_format_notices in JSON)"
+            )
+        return "\n".join(lines)
+
     def _format_footer(self, report: AnalysisReport) -> str:
         """Format report footer."""
         duration = f"{report.summary.duration_seconds:.2f}s"
 
         lines = ["========================"]
 
-        if report.summary.total_issues == 0:
+        if report.summary.files_analyzed == 0:
+            lines.append(f"⚠️  No files were analyzed. Analysis complete in {duration}")
+        elif report.summary.total_issues == 0:
             lines.append(f"✅ No issues found! Analysis complete in {duration}")
         else:
             lines.append(f"✅ Analysis complete in {duration}")

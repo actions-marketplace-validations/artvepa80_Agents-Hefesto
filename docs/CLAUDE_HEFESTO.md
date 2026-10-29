@@ -14,7 +14,7 @@
 ### Pre-Commit & Pre-Push Quality Gates (OBLIGATORIO)
 **ANTES DE TODO COMMIT Y PUSH:**
 1. **Ejecutar Omega Guardian**: `omega-guardian run`
-2. **Ejecutar Agente Hefesto**: `hefesto analyze --project .`
+2. **Ejecutar Agente Hefesto**: `hefesto analyze .`
 3. **Bloquear si hay hallazgos críticos** - NO omitir estos pasos
 
 Los git hooks instalados en `.git/hooks/pre-commit` y `.git/hooks/pre-push` **enforcement** automático de estas validaciones.
@@ -28,8 +28,8 @@ Los git hooks instalados en `.git/hooks/pre-commit` y `.git/hooks/pre-push` **en
 ### Estilo de Código
 - Formato: Black (`black hefesto/ tests/`)
 - Imports: isort (`isort hefesto/ tests/`)
-- Type checking: mypy (`mypy hefesto/ --ignore-missing-imports`)
-- Linting: flake8 (`flake8 hefesto/ tests/`)
+- Type checking: `python -m mypy hefesto --ignore-missing-imports`
+- Linting: `ruff check` (E/W/F, same ignores as Flake8) and `python -m flake8 hefesto tests`
 
 ---
 
@@ -41,7 +41,7 @@ These rules ensure Hefesto achieves enterprise-grade quality, maintainability, s
 
 **Mission**: Transform code quality validation with AI-powered analysis that catches critical bugs before production.
 
-**Current Status (v4.13.0)**: Sistema completo de análisis con ML, BigQuery integration, OMEGA Guardian monitoring, y tier-based licensing.
+**Current Status (v4.20.4)**: Sistema completo de análisis con ML, OMEGA Guardian monitoring, y tier-based licensing. Anonymous PostHog usage events (on by default, with opt-out), `hefesto init`, a PyPI newer-version notice, and CLI PRO/OMEGA notices (`HEFESTO_NO_UPSELL=1` hides them).
 
 ---
 
@@ -196,6 +196,7 @@ These rules ensure Hefesto achieves enterprise-grade quality, maintainability, s
 - **G-4 (MUST)** `omega-guardian run` passes before commit
 - **G-5 (MUST)** `hefesto analyze .` passes before commit
 - **G-6 (MUST)** Memory usage tests pass (< 2GB peak)
+- **G-7 (SHOULD)** Keep the full-repo scan clean: `.github/workflows/hefesto.yml` (job `hefesto-scan`) uploads SARIF to code scanning (category `hefesto`) on every push and PR to `main`; it is non-blocking (`continue-on-error: true`) until the known CRITICAL finding (`scripts/validate_aggregates_jsonl.py:48`) is fixed. Excludes go only in the root `.hefesto.yaml`, written as path segments (`tests/fixtures/`), never globs (`tests/fixtures/**` matches nothing); paths passed explicitly are not filtered.
 
 ### 📊 **Performance Gates**
 - **G-7 (MUST)** Analysis latency < 5s for files < 1000 LOC
@@ -216,6 +217,7 @@ These rules ensure Hefesto achieves enterprise-grade quality, maintainability, s
   ```
 - **GH-2 (SHOULD NOT)** Refer to Claude/AI in commit messages
 - **GH-3 (MUST)** Include domain context in commit scope
+- **Commit trailers (MUST)** Public commits made with the maintainer's tooling carry only `Co-authored-by: HefestoAI <noreply@narapallc.com>` as co-author trailer; no other tool or automation trailers. CI checks this with `python scripts/guard_public_repo.py --check-commits <base>..<head>`.
 
 ### 🚀 **Deployment Requirements**
 - **GH-4 (MUST)** All releases require full test suite passing
@@ -348,7 +350,10 @@ black hefesto/ tests/ || exit 1
 isort hefesto/ tests/ || exit 1
 
 # 5. Type Checking
-mypy hefesto/ --ignore-missing-imports || exit 1
+python -m mypy hefesto --ignore-missing-imports || exit 1
+
+# 6. Ruff (the E/W/F rules CI enforces with flake8)
+ruff check || exit 1
 ```
 
 **Git hooks enforce these automatically** - DO NOT bypass them.
@@ -362,7 +367,7 @@ mypy hefesto/ --ignore-missing-imports || exit 1
 
 ---
 
-**Remember**: We're building the **AI-Powered Code Quality Guardian** - enterprise-grade, reliable, and trusted by development teams worldwide.
+**Remember**: We're building the **release truth engine for AI-generated code** - enterprise-grade, reliable, and trusted by development teams worldwide.
 
 ---
 
